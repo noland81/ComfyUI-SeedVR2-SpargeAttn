@@ -62,3 +62,62 @@
 **Files**:
 - `src/interfaces/dit_model_loader.py` — UI dropdown
 - `src/core/model_configuration.py` — validation + apply
+
+## F4. Standalone GPU-Direct Desktop App
+
+**Yêu cầu**: PySide6 desktop app chạy SeedVR2 pipeline trực tiếp trên GPU, không cần ComfyUI.
+
+**Cách hoạt động**:
+1. User chạy `python app.py` → cửa sổ PySide6 mở
+2. Click "Load Models" → DiT + VAE load vào VRAM trên QThread (UI không freeze)
+3. Drag & drop hoặc browse ảnh input
+4. Chọn resolution preset (2K-12K) → auto-config blocks_to_swap, tiling, blur
+5. Click "Upscale" → pipeline chạy trên QThread, progress bar cập nhật theo 4 phases
+6. Output hiển thị → click "Save Output" để lưu
+
+**Pipeline flow (trong UpscaleWorker QThread)**:
+1. Blur preprocessing (nếu preset yêu cầu)
+2. Nếu 9K+: chia tiles → xử lý từng tile → ghép lại
+3. Nếu <9K: xử lý trực tiếp qua 4-phase pipeline
+4. Phase 1: encode_all_batches (VAE encode)
+5. Phase 2: upscale_all_batches (DiT inference)
+6. Phase 3: decode_all_batches (VAE decode)
+7. Phase 4: postprocess_all_batches (color correction)
+
+**GPU Optimizations**:
+- TF32 enabled cho matmul + cudnn
+- cudnn.benchmark = True
+- SpargeAttn default attention
+- torch.compile optional (inductor backend)
+- Model cached trong VRAM giữa các lần chạy
+- torch.inference_mode() context
+
+**QUAN TRỌNG**:
+- GPU work PHẢI chạy trên QThread, KHÔNG ĐƯỢC chạy trên main thread (UI freeze)
+- QImage cần contiguous memory → result_np phải là C-contiguous
+- Pipeline imports cần script_dir trong sys.path
+- PYTORCH_CUDA_ALLOC_CONF phải set TRƯỚC import torch
+
+**Files**:
+- `app.py` — `SeedVR2Pipeline`, `UpscaleWorker(QThread)`, `ModelLoadWorker(QThread)`, `MainWindow(QMainWindow)`
+
+## F5. Auto-Tiling for High Resolution (9K/12K)
+
+**Yêu cầu**: Tự động chia ảnh thành tiles cho resolution 9K+ (DiT không xử lý nổi full image).
+
+**Cách hoạt động**:
+1. Chia ảnh thành grid tiles với overlap (5% overlap_rate)
+2. Xử lý từng tile qua SeedVR2 pipeline (resolution = preset / grid_size)
+3. Ghép lại với weighted blending tại vùng overlap (linear ramp)
+
+**Tiling grid**:
+- 9K: 2x2 tiles (4 tiles total)
+- 12K: 3x3 tiles (9 tiles total)
+
+**QUAN TRỌNG**:
+- Scale factor tính từ tile đầu tiên, áp dụng cho tất cả tiles
+- Weight mask dùng linear ramp tại overlap edges → tránh seam artifacts
+- Overlap phải đủ lớn (>= 16px) để blending smooth
+
+**Files**:
+- `app.py` — `_tile_and_upscale()` function
