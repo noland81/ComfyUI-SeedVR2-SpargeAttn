@@ -16,6 +16,15 @@ import sys
 import os
 import time
 
+# Fix Windows console encoding (cp1252 can't handle emoji in SeedVR2 logs)
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # Setup path before any project imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
@@ -50,6 +59,7 @@ from src.core.generation_phases import (
 from src.utils.debug import Debug
 from src.utils.constants import get_script_directory, SEEDVR2_FOLDER_NAME, get_base_cache_dir
 from src.utils.model_registry import get_available_dit_models, DEFAULT_VAE
+from src.utils.downloads import download_weight
 from src.optimization.memory_manager import clear_memory, get_gpu_backend
 
 
@@ -152,6 +162,18 @@ class SeedVR2Pipeline:
             vae_device=self.device,
             debug=self.debug
         )
+
+        if progress_fn:
+            progress_fn(12, f"Checking/downloading models: {self.dit_model}...")
+
+        # Auto-download models if not present (matches ComfyUI node behavior)
+        if not download_weight(dit_model=self.dit_model, vae_model=self.vae_model,
+                               model_dir=self.model_dir, debug=self.debug):
+            raise RuntimeError(
+                f"Failed to download required models. "
+                f"DiT: {self.dit_model}, VAE: {self.vae_model}. "
+                f"Check internet connection and try again."
+            )
 
         if progress_fn:
             progress_fn(15, f"Loading DiT model: {self.dit_model}...")

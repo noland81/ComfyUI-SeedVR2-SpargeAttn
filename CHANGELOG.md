@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.2.1 (2026-03-12) — Auto-download models + Windows encoding fix
+
+### Tính năng mới
+- Auto-download models: `download_weight()` tự tải DiT + VAE từ HuggingFace nếu chưa có
+- Khi click "Load Models", app sẽ tự kiểm tra + tải model cần thiết
+
+### Bug fixes
+- Fix Windows console encoding crash: emoji characters (📊⚡) trong SeedVR2 logs gây UnicodeEncodeError trên cp1252
+- Thêm `sys.stdout.reconfigure(encoding='utf-8')` trước tất cả SeedVR2 imports
+
+### Files thay đổi
+- `app.py` — Thêm download_weight() import + call, thêm UTF-8 encoding fix
+- `VERSION.txt` — 1.2.0 → 1.2.1
+- `CHANGELOG.md` — Thêm entry v1.2.1
+
 ## v1.2.0 (2026-03-12) — Deep audit fix: match exact ComfyUI workflow processing chain
 
 ### Bug fixes (CRITICAL)
