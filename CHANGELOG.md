@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.2.0 (2026-03-12) — Deep audit fix: match exact ComfyUI workflow processing chain
+
+### Bug fixes (CRITICAL)
+- **9K/12K preprocessing chain was completely missing**: Workflows do LoadImage → Resize(keep proportion) → Blur → Make-even → Tile → SeedVR2. App was: Load → Blur → Tile raw input → SeedVR2. Output would be ~1/4 expected size and wrong quality.
+- **9K tile grid wrong**: Was fixed 2x2 (4 tiles). Workflow uses adaptive: landscape 2x1, portrait 1x2 (2 tiles). Too many tiles = unnecessary seams + slower.
+- **12K tile grid wrong**: Was 3x3 (9 tiles). Workflow uses 2x2 (4 tiles). Same issue.
+- **Per-tile resolution wrong**: Was `preset_resolution / grid_size`. Should be `min(tile_w, tile_h)` matching ImpactMinMax(mode=false). This caused SeedVR2 to produce wrong output scale for each tile.
+- **4K/6K missing pre-resize**: Workflows pre-resize to 4096/6000 (keep proportion, lanczos) before blur + SeedVR2. App skipped this, sending raw input directly.
+- **4K blocks_to_swap wrong**: Was 9, workflow uses 8.
+- **4K max_resolution wrong**: Was 4000, workflow uses 6000.
+- **4K/6K resolution was fixed**: Should be auto-computed as min(resized_w, resized_h) from pre-resized dimensions, matching ImpactMinMax.
+
+### Tính năng mới
+- Pre-resize step (keep proportion, lanczos) for 4K+ presets
+- Adaptive tile grid for 9K: landscape → 2x1, portrait → 1x2
+- Make-dimensions-even stretch resize for tiled presets (matches workflow math)
+- Auto-computed resolution from pre-resized image dimensions
+
+### Removed
+- torch.compile option: Not officially supported on Windows GPU (requires triton-windows + MSVC build tools + vcvars64.bat). Too fragile for production use.
+
+### Preset values (matching ComfyUI workflows exactly)
+| Preset | pre_resize | blur | tile_mode | resolution | max_res | blocks | vae_tile | overlap |
+|--------|-----------|------|-----------|------------|---------|--------|----------|---------|
+| 2K     | —         | 0    | —         | 2000       | 2000    | 9      | 1024     | 64      |
+| 3K     | —         | 0    | —         | 3000       | 3000    | 9      | 1024     | 64      |
+| 4K     | 4096      | 1    | —         | auto       | 6000    | 8      | 768      | 32      |
+| 6K     | 6000      | 2    | —         | auto       | 6000    | 16     | 768      | 32      |
+| 9K     | 9000      | 2    | adaptive  | auto       | 9000    | 32     | 768      | 32      |
+| 12K    | 12000     | 3    | 2x2       | auto       | 12000   | 32     | 768      | 32      |
+
+### Processing flow by preset
+- **2K/3K**: Load → SeedVR2 (direct upscale, no preprocessing)
+- **4K/6K**: Load → Resize(keep prop) → Blur → SeedVR2
+- **9K**: Load → Resize(9000, keep prop) → Blur → Make-even → Tile(adaptive) → SeedVR2/tile → Reassemble
+- **12K**: Load → Resize(12000, keep prop) → Blur → Make-even → Tile(2x2) → SeedVR2/tile → Reassemble
+
+### Files thay đổi
+- `app.py` — Complete preprocessing rewrite, fix all presets, remove torch.compile
+- `VERSION.txt` — 1.1.1 → 1.2.0
+- `CHANGELOG.md` — Thêm entry v1.2.0
+- `FEATURES.md` — Cập nhật F4 + F5
+
 ## v1.1.1 (2026-03-12) — Fix VRAM safety: match exact workflow parameters
 
 ### Bug fixes

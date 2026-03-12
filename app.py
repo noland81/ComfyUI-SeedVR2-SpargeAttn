@@ -57,22 +57,38 @@ from src.optimization.memory_manager import clear_memory, get_gpu_backend
 
 RESOLUTION_PRESETS = {
     # Values extracted from user's actual ComfyUI workflows for RTX 4090 (24GB)
-    "2K": {"resolution": 2000, "max_resolution": 2000, "tile_grid": None, "blur_radius": 0,
+    #
+    # 2K/3K (workflow-refix-*): No preprocessing, direct SeedVR2 upscale
+    # 4K/6K (comfyui_workflow_*): Pre-resize (keep proportion) → Blur → SeedVR2
+    # 9K (comfyui_workflow_9k): Pre-resize → Blur → Make-even → Adaptive tile → SeedVR2
+    # 12K (comfyui_workflow_12k): Pre-resize → Blur → Make-even → 2x2 tile → SeedVR2
+    #
+    # pre_resize: Resize longest edge to this value (keep proportion, lanczos) before SeedVR2
+    # tile_mode: None=direct, "adaptive"=landscape 2x1/portrait 1x2, (rows,cols)=fixed grid
+    # resolution: "auto"=min(resized_w, resized_h) or fixed int
+
+    "2K": {"pre_resize": None, "blur_radius": 0, "tile_mode": None,
+           "resolution": 2000, "max_resolution": 2000,
            "blocks_to_swap": 9, "vae_tile_size": 1024, "vae_tile_overlap": 64,
            "latent_noise_scale": 0.0},
-    "3K": {"resolution": 3000, "max_resolution": 3000, "tile_grid": None, "blur_radius": 0,
+    "3K": {"pre_resize": None, "blur_radius": 0, "tile_mode": None,
+           "resolution": 3000, "max_resolution": 3000,
            "blocks_to_swap": 9, "vae_tile_size": 1024, "vae_tile_overlap": 64,
            "latent_noise_scale": 0.0},
-    "4K": {"resolution": 4000, "max_resolution": 4000, "tile_grid": None, "blur_radius": 1,
-           "blocks_to_swap": 9, "vae_tile_size": 768, "vae_tile_overlap": 32,
+    "4K": {"pre_resize": 4096, "blur_radius": 1, "tile_mode": None,
+           "resolution": "auto", "max_resolution": 6000,
+           "blocks_to_swap": 8, "vae_tile_size": 768, "vae_tile_overlap": 32,
            "latent_noise_scale": 0.001},
-    "6K": {"resolution": 6000, "max_resolution": 6000, "tile_grid": None, "blur_radius": 2,
+    "6K": {"pre_resize": 6000, "blur_radius": 2, "tile_mode": None,
+           "resolution": "auto", "max_resolution": 6000,
            "blocks_to_swap": 16, "vae_tile_size": 768, "vae_tile_overlap": 32,
            "latent_noise_scale": 0.001},
-    "9K": {"resolution": 9000, "max_resolution": 9000, "tile_grid": (2, 2), "blur_radius": 2,
+    "9K": {"pre_resize": 9000, "blur_radius": 2, "tile_mode": "adaptive",
+           "resolution": "auto", "max_resolution": 9000,
            "blocks_to_swap": 32, "vae_tile_size": 768, "vae_tile_overlap": 32,
            "latent_noise_scale": 0.001},
-    "12K": {"resolution": 12000, "max_resolution": 12000, "tile_grid": (3, 3), "blur_radius": 3,
+    "12K": {"pre_resize": 12000, "blur_radius": 3, "tile_mode": (2, 2),
+            "resolution": "auto", "max_resolution": 12000,
             "blocks_to_swap": 32, "vae_tile_size": 768, "vae_tile_overlap": 32,
             "latent_noise_scale": 0.001},
 }
@@ -83,13 +99,11 @@ RESOLUTION_PRESETS = {
 class SeedVR2Pipeline:
     """Direct GPU pipeline — models stay in VRAM between runs."""
 
-    def __init__(self, dit_model, device="cuda:0", attention_mode="spargeattn",
-                 use_torch_compile=False):
+    def __init__(self, dit_model, device="cuda:0", attention_mode="spargeattn"):
         self.device = device
         self.dit_model = dit_model
         self.vae_model = DEFAULT_VAE
         self.attention_mode = attention_mode
-        self.use_torch_compile = use_torch_compile
 
         self.runner = None
         self.ctx = None
@@ -144,17 +158,6 @@ class SeedVR2Pipeline:
             progress_fn(15, f"  blocks_to_swap={blocks_to_swap}, "
                            f"vae_tile={vae_tile_size}, overlap={vae_tile_overlap}")
 
-        torch_compile_args = None
-        if self.use_torch_compile:
-            torch_compile_args = {
-                "backend": "inductor",
-                "mode": "default",
-                "fullgraph": False,
-                "dynamic": False,
-                "dynamo_cache_size_limit": 64,
-                "dynamo_recompile_limit": 128,
-            }
-
         self.runner, cache_context = prepare_runner(
             dit_model=self.dit_model,
             vae_model=self.vae_model,
@@ -173,8 +176,8 @@ class SeedVR2Pipeline:
             decode_tile_size=(vae_tile_size, vae_tile_size),
             decode_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
             attention_mode=self.attention_mode,
-            torch_compile_args_dit=torch_compile_args,
-            torch_compile_args_vae=torch_compile_args,
+            torch_compile_args_dit=None,
+            torch_compile_args_vae=None,
         )
         self.ctx['cache_context'] = cache_context
 
@@ -306,6 +309,38 @@ class SeedVR2Pipeline:
         return result_np
 
 
+def _resize_keep_proportion(image_np, target_size):
+    """
+    Resize image keeping aspect ratio, longest edge = target_size.
+    Uses Lanczos interpolation. Matches ComfyUI ImageResize+ (keep proportion).
+    """
+    img = Image.fromarray(image_np)
+    w, h = img.size
+    if w >= h:
+        new_w = target_size
+        new_h = round(h * target_size / w)
+    else:
+        new_h = target_size
+        new_w = round(w * target_size / h)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    return np.array(img)
+
+
+def _make_dimensions_even(image_np, divisor=2):
+    """
+    Stretch-resize to make dimensions divisible by divisor.
+    Matches ComfyUI workflow math: round(dim / divisor) * divisor.
+    """
+    h, w = image_np.shape[:2]
+    new_w = round(w / divisor) * divisor
+    new_h = round(h / divisor) * divisor
+    if new_w != w or new_h != h:
+        img = Image.fromarray(image_np)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        return np.array(img)
+    return image_np
+
+
 def _apply_gaussian_blur(image_np, radius):
     """Apply Gaussian blur to numpy image using PIL."""
     from PIL import ImageFilter
@@ -314,48 +349,63 @@ def _apply_gaussian_blur(image_np, radius):
     return np.array(img)
 
 
-def _tile_and_upscale(pipeline, image_np, preset, seed, color_correction,
-                      input_noise_scale, latent_noise_scale, progress_fn):
+def _tile_and_upscale(pipeline, image_np, tile_mode, max_resolution,
+                      seed, color_correction, input_noise_scale,
+                      latent_noise_scale, overlap_rate, progress_fn):
     """
-    Split image into overlapping tiles, upscale each, and reassemble.
-    Used for 9K+ resolutions that exceed single-pass VRAM capacity.
+    Split pre-processed image into overlapping tiles, upscale each, reassemble.
+    Matches ComfyUI TTP_Image_Tile_Batch + TTP_Image_Assy behavior.
+
+    tile_mode: "adaptive" — landscape: 2 cols x 1 row, portrait: 1 col x 2 rows
+               (rows, cols) — fixed grid (e.g. (2,2) for 12K)
+
+    Resolution per tile = min(tile_w, tile_h) — matches ImpactMinMax(mode=false).
+    max_resolution stays at preset level (NOT divided).
     """
-    rows, cols = preset["tile_grid"]
     h, w, c = image_np.shape
-    overlap_rate = 0.05
 
-    # Compute tile sizes with overlap
-    tile_h = h // rows
-    tile_w = w // cols
-    overlap_h = max(int(tile_h * overlap_rate), 16)
-    overlap_w = max(int(tile_w * overlap_rate), 16)
+    # Determine tile grid (matches ComfyUI ImpactCompare + CR Set Value On Boolean)
+    if tile_mode == "adaptive":
+        if w >= h:
+            cols, rows = 2, 1  # landscape: split horizontally
+        else:
+            cols, rows = 1, 2  # portrait: split vertically
+    else:
+        rows, cols = tile_mode
 
+    # Base tile sizes
+    base_tile_h = h // rows
+    base_tile_w = w // cols
+    overlap_px_h = max(int(base_tile_h * overlap_rate), 16)
+    overlap_px_w = max(int(base_tile_w * overlap_rate), 16)
+
+    # Cut tiles with overlap
     tiles = []
     positions = []
     for r in range(rows):
-        for col_idx in range(cols):
-            y0 = max(0, r * tile_h - overlap_h)
-            y1 = min(h, (r + 1) * tile_h + overlap_h)
-            x0 = max(0, col_idx * tile_w - overlap_w)
-            x1 = min(w, (col_idx + 1) * tile_w + overlap_w)
+        for c_idx in range(cols):
+            y0 = max(0, r * base_tile_h - overlap_px_h)
+            y1 = min(h, (r + 1) * base_tile_h + overlap_px_h)
+            x0 = max(0, c_idx * base_tile_w - overlap_px_w)
+            x1 = min(w, (c_idx + 1) * base_tile_w + overlap_px_w)
             tiles.append(image_np[y0:y1, x0:x1])
-            positions.append((r, col_idx, y0, y1, x0, x1))
+            positions.append((r, c_idx, y0, y1, x0, x1))
 
     total_tiles = len(tiles)
     upscaled_tiles = []
 
-    # Per-tile resolution: scale proportionally
-    per_tile_resolution = preset["resolution"] // max(rows, cols)
-    per_tile_max = preset["max_resolution"] // max(rows, cols)
-
     for i, tile in enumerate(tiles):
-        def tile_progress(pct, msg):
-            overall = int((i / total_tiles + pct / 100 / total_tiles) * 100)
+        tile_h_px, tile_w_px = tile.shape[:2]
+        # Resolution = min(tile_w, tile_h) — matching ImpactMinMax(mode=false)
+        tile_resolution = min(tile_w_px, tile_h_px)
+
+        def tile_progress(pct, msg, _i=i):
+            overall = int((_i / total_tiles + pct / 100 / total_tiles) * 100)
             if progress_fn:
-                progress_fn(overall, f"Tile {i+1}/{total_tiles}: {msg}")
+                progress_fn(overall, f"Tile {_i+1}/{total_tiles}: {msg}")
 
         result = pipeline.upscale_image(
-            tile, resolution=per_tile_resolution, max_resolution=per_tile_max,
+            tile, resolution=tile_resolution, max_resolution=max_resolution,
             seed=seed, color_correction=color_correction,
             input_noise_scale=input_noise_scale,
             latent_noise_scale=latent_noise_scale,
@@ -372,7 +422,7 @@ def _tile_and_upscale(pipeline, image_np, preset, seed, color_correction,
     output = np.zeros((out_h, out_w, c), dtype=np.float32)
     weights = np.zeros((out_h, out_w, 1), dtype=np.float32)
 
-    for idx, (r, col_idx, y0, y1, x0, x1) in enumerate(positions):
+    for idx, (r, c_idx, y0, y1, x0, x1) in enumerate(positions):
         tile_up = upscaled_tiles[idx].astype(np.float32)
         th, tw = tile_up.shape[:2]
 
@@ -388,10 +438,10 @@ def _tile_and_upscale(pipeline, image_np, preset, seed, color_correction,
         tw = out_x1 - out_x0
         tile_up = tile_up[:th, :tw]
 
-        # Create weight mask with linear falloff at overlap edges
+        # Weight mask with linear ramp at overlap edges
         w_mask = np.ones((th, tw, 1), dtype=np.float32)
-        scaled_overlap_h = int(overlap_h * scale_h)
-        scaled_overlap_w = int(overlap_w * scale_w)
+        scaled_overlap_h = int(overlap_px_h * scale_h)
+        scaled_overlap_w = int(overlap_px_w * scale_w)
 
         if r > 0 and scaled_overlap_h > 0:
             ramp = np.linspace(0, 1, min(scaled_overlap_h, th)).reshape(-1, 1, 1)
@@ -399,10 +449,10 @@ def _tile_and_upscale(pipeline, image_np, preset, seed, color_correction,
         if r < rows - 1 and scaled_overlap_h > 0:
             ramp = np.linspace(1, 0, min(scaled_overlap_h, th)).reshape(-1, 1, 1)
             w_mask[-min(scaled_overlap_h, th):] *= ramp
-        if col_idx > 0 and scaled_overlap_w > 0:
+        if c_idx > 0 and scaled_overlap_w > 0:
             ramp = np.linspace(0, 1, min(scaled_overlap_w, tw)).reshape(1, -1, 1)
             w_mask[:, :min(scaled_overlap_w, tw)] *= ramp
-        if col_idx < cols - 1 and scaled_overlap_w > 0:
+        if c_idx < cols - 1 and scaled_overlap_w > 0:
             ramp = np.linspace(1, 0, min(scaled_overlap_w, tw)).reshape(1, -1, 1)
             w_mask[:, -min(scaled_overlap_w, tw):] *= ramp
 
@@ -465,27 +515,58 @@ class UpscaleWorker(QThread):
         try:
             preset = RESOLUTION_PRESETS[self.preset_name]
             image = self.image_np.copy()
-
-            # Use preset latent_noise_scale (0.001 for 4K+, 0.0 for 2K-3K)
             latent_noise = preset.get("latent_noise_scale", self.latent_noise_scale)
 
-            # Apply blur if configured
+            # ── Step 1: Pre-resize (keep proportion, lanczos) ──
+            # 4K+: resize longest edge to target before SeedVR2
+            # 2K/3K: skip (direct upscale)
+            pre_resize = preset.get("pre_resize")
+            if pre_resize:
+                h0, w0 = image.shape[:2]
+                self.progress.emit(1, f"Pre-resize to {pre_resize}px (keep proportion)...")
+                image = _resize_keep_proportion(image, pre_resize)
+                h1, w1 = image.shape[:2]
+                print(f"[PRE-RESIZE] {w0}x{h0} → {w1}x{h1}")
+
+            # ── Step 2: Compute resolution ──
+            # "auto": min(w, h) of pre-resized image (matches ImpactMinMax)
+            # Fixed int: use directly (2K/3K)
+            h, w = image.shape[:2]
+            if preset["resolution"] == "auto":
+                resolution = min(w, h)
+            else:
+                resolution = preset["resolution"]
+
+            # ── Step 3: Blur ──
             if preset["blur_radius"] > 0:
                 self.progress.emit(2, f"Applying blur (radius={preset['blur_radius']})...")
                 image = _apply_gaussian_blur(image, preset["blur_radius"])
 
-            # Tiled or direct processing
-            if preset["tile_grid"] is not None:
+            # ── Step 4: Process ──
+            tile_mode = preset.get("tile_mode")
+            if tile_mode is not None:
+                # Tiled processing (9K/12K)
+                # Make dimensions even (stretch resize — matches workflow math)
+                image = _make_dimensions_even(image, divisor=2)
+                h2, w2 = image.shape[:2]
+                print(f"[TILE-PREPROCESS] After make-even: {w2}x{h2}, "
+                      f"tile_mode={tile_mode}")
+
                 result = _tile_and_upscale(
-                    self.pipeline, image, preset,
-                    self.seed, self.color_correction,
-                    self.input_noise_scale, latent_noise,
-                    lambda p, m: self.progress.emit(p, m)
+                    self.pipeline, image, tile_mode,
+                    max_resolution=preset["max_resolution"],
+                    seed=self.seed,
+                    color_correction=self.color_correction,
+                    input_noise_scale=self.input_noise_scale,
+                    latent_noise_scale=latent_noise,
+                    overlap_rate=0.05,
+                    progress_fn=lambda p, m: self.progress.emit(p, m)
                 )
             else:
+                # Direct processing (2K/3K/4K/6K)
                 result = self.pipeline.upscale_image(
                     image,
-                    resolution=preset["resolution"],
+                    resolution=resolution,
                     max_resolution=preset["max_resolution"],
                     seed=self.seed,
                     color_correction=self.color_correction,
@@ -695,7 +776,7 @@ class MainWindow(QMainWindow):
         self.blocks_spin.setValue(9)
         self.blocks_spin.setToolTip("DiT transformer blocks offloaded to CPU.\n"
                                      "Higher = less VRAM but slower.\n"
-                                     "2K-4K: 9, 6K: 16, 9K-12K: 32")
+                                     "2K-3K: 9, 4K: 8, 6K: 16, 9K-12K: 32")
         adv_layout.addWidget(self.blocks_spin)
 
         # VAE tile size
@@ -717,11 +798,6 @@ class MainWindow(QMainWindow):
         self.vae_overlap_spin.setValue(32)
         self.vae_overlap_spin.setToolTip("VAE tile overlap.\n2K-3K: 64, 4K+: 32")
         adv_layout.addWidget(self.vae_overlap_spin)
-
-        # torch.compile
-        self.compile_check = QCheckBox("torch.compile")
-        self.compile_check.setToolTip("Enable torch.compile (inductor backend). First run slower, subsequent faster.")
-        adv_layout.addWidget(self.compile_check)
 
         adv_layout.addStretch()
         controls_layout.addWidget(self.advanced_group)
@@ -889,7 +965,6 @@ class MainWindow(QMainWindow):
     def _on_load_models(self):
         dit_model = self.model_combo.currentText()
         attention = self.attn_combo.currentText()
-        use_compile = self.compile_check.isChecked()
         blocks = self.blocks_spin.value()
         vae_tile = self.vae_tile_spin.value()
         vae_overlap = self.vae_overlap_spin.value()
@@ -898,7 +973,6 @@ class MainWindow(QMainWindow):
             dit_model=dit_model,
             device="cuda:0",
             attention_mode=attention,
-            use_torch_compile=use_compile,
         )
 
         self.load_btn.setEnabled(False)
@@ -1008,11 +1082,12 @@ class MainWindow(QMainWindow):
         self.load_btn.setEnabled(False)
 
         preset = RESOLUTION_PRESETS[preset_name]
-        self.statusBar().showMessage(
-            f"Upscaling to {preset_name} "
-            f"(swap={preset['blocks_to_swap']}, tile={preset['vae_tile_size']}, "
-            f"VAE tiled=ON)..."
-        )
+        info = f"swap={preset['blocks_to_swap']}, vae_tile={preset['vae_tile_size']}"
+        if preset.get("pre_resize"):
+            info += f", pre-resize={preset['pre_resize']}"
+        if preset.get("tile_mode"):
+            info += f", tile={preset['tile_mode']}"
+        self.statusBar().showMessage(f"Upscaling to {preset_name} ({info})...")
 
         self.worker = UpscaleWorker(
             pipeline=self.pipeline,
