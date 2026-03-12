@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.1.1 (2026-03-12) — Fix VRAM safety: match exact workflow parameters
+
+### Bug fixes
+- blocks_to_swap quá thấp (0 thay vì 9 cho 2K-3K, 8 thay vì 32 cho 9K-12K) → OOM trên 24GB
+- VAE tile size sai (768 cho tất cả, đúng phải 1024 cho 2K-3K)
+- VAE tile overlap sai (64 cho tất cả, đúng phải 32 cho 4K+)
+- latent_noise_scale sai (0.0 cho 4K+, đúng phải 0.001)
+- blur_radius 6K sai (1 thay vì 2)
+
+### Tính năng mới
+- Auto-reload models: khi đổi preset cần blocks_to_swap/VAE tile khác → tự động reload
+- UI thêm controls: VAE tile size + VAE tile overlap trong Advanced Settings
+- Auto-load: click Upscale khi chưa load models → tự động load rồi upscale
+- Status bar hiển thị chi tiết: swap, tile, VAE tiled=ON, VRAM usage
+
+### Preset values (khớp ComfyUI workflow thực tế cho RTX 4090 24GB)
+| Preset | blocks_to_swap | vae_tile | overlap | latent_noise | blur |
+|--------|---------------|----------|---------|-------------|------|
+| 2K     | 9             | 1024     | 64      | 0.0         | 0    |
+| 3K     | 9             | 1024     | 64      | 0.0         | 0    |
+| 4K     | 9             | 768      | 32      | 0.001       | 1    |
+| 6K     | 16            | 768      | 32      | 0.001       | 2    |
+| 9K     | 32            | 768      | 32      | 0.001       | 2    |
+| 12K    | 32            | 768      | 32      | 0.001       | 3    |
+
+### Files thay đổi
+- `app.py` — Fix presets, thêm auto-reload, thêm VAE controls, thêm _pending_upscale flow
+- `VERSION.txt` — 1.1.0 → 1.1.1
+- `CHANGELOG.md` — Thêm entry v1.1.1
+
 ## v1.1.0 (2026-03-12) — Standalone GPU-Direct Upscaler App
 
 ### Tính năng mới

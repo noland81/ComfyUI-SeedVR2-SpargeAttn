@@ -56,18 +56,25 @@ from src.optimization.memory_manager import clear_memory, get_gpu_backend
 # ─── Resolution Presets ───────────────────────────────────────────────
 
 RESOLUTION_PRESETS = {
+    # Values extracted from user's actual ComfyUI workflows for RTX 4090 (24GB)
     "2K": {"resolution": 2000, "max_resolution": 2000, "tile_grid": None, "blur_radius": 0,
-           "blocks_to_swap": 0, "vae_tile_size": 768},
+           "blocks_to_swap": 9, "vae_tile_size": 1024, "vae_tile_overlap": 64,
+           "latent_noise_scale": 0.0},
     "3K": {"resolution": 3000, "max_resolution": 3000, "tile_grid": None, "blur_radius": 0,
-           "blocks_to_swap": 0, "vae_tile_size": 768},
+           "blocks_to_swap": 9, "vae_tile_size": 1024, "vae_tile_overlap": 64,
+           "latent_noise_scale": 0.0},
     "4K": {"resolution": 4000, "max_resolution": 4000, "tile_grid": None, "blur_radius": 1,
-           "blocks_to_swap": 8, "vae_tile_size": 768},
-    "6K": {"resolution": 6000, "max_resolution": 6000, "tile_grid": None, "blur_radius": 1,
-           "blocks_to_swap": 16, "vae_tile_size": 768},
-    "9K": {"resolution": 9000, "max_resolution": 9000, "tile_grid": (2, 2), "blur_radius": 3,
-           "blocks_to_swap": 8, "vae_tile_size": 768},
+           "blocks_to_swap": 9, "vae_tile_size": 768, "vae_tile_overlap": 32,
+           "latent_noise_scale": 0.001},
+    "6K": {"resolution": 6000, "max_resolution": 6000, "tile_grid": None, "blur_radius": 2,
+           "blocks_to_swap": 16, "vae_tile_size": 768, "vae_tile_overlap": 32,
+           "latent_noise_scale": 0.001},
+    "9K": {"resolution": 9000, "max_resolution": 9000, "tile_grid": (2, 2), "blur_radius": 2,
+           "blocks_to_swap": 32, "vae_tile_size": 768, "vae_tile_overlap": 32,
+           "latent_noise_scale": 0.001},
     "12K": {"resolution": 12000, "max_resolution": 12000, "tile_grid": (3, 3), "blur_radius": 3,
-            "blocks_to_swap": 8, "vae_tile_size": 768},
+            "blocks_to_swap": 32, "vae_tile_size": 768, "vae_tile_overlap": 32,
+            "latent_noise_scale": 0.001},
 }
 
 
@@ -91,8 +98,22 @@ class SeedVR2Pipeline:
         self.model_dir = get_base_cache_dir()
         self._loaded = False
 
-    def load_models(self, blocks_to_swap=0, vae_tile_size=768, progress_fn=None):
-        """Load models into VRAM (one-time cost)."""
+        # Track loaded settings for auto-reload detection
+        self._loaded_blocks_to_swap = None
+        self._loaded_vae_tile_size = None
+        self._loaded_vae_tile_overlap = None
+
+    def needs_reload(self, blocks_to_swap, vae_tile_size, vae_tile_overlap):
+        """Check if model needs reloading for different settings."""
+        if not self._loaded:
+            return True
+        return (self._loaded_blocks_to_swap != blocks_to_swap or
+                self._loaded_vae_tile_size != vae_tile_size or
+                self._loaded_vae_tile_overlap != vae_tile_overlap)
+
+    def load_models(self, blocks_to_swap=9, vae_tile_size=768,
+                    vae_tile_overlap=32, progress_fn=None):
+        """Load models into VRAM. Re-call with different params to reload."""
         if progress_fn:
             progress_fn(5, "Setting up CUDA optimizations...")
 
@@ -100,6 +121,14 @@ class SeedVR2Pipeline:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
+
+        # Free existing models if reloading
+        if self._loaded:
+            if progress_fn:
+                progress_fn(5, "Freeing previous models...")
+            self.runner = None
+            self.ctx = None
+            clear_memory()
 
         if progress_fn:
             progress_fn(10, "Initializing generation context...")
@@ -111,7 +140,9 @@ class SeedVR2Pipeline:
         )
 
         if progress_fn:
-            progress_fn(20, f"Loading DiT model: {self.dit_model}...")
+            progress_fn(15, f"Loading DiT model: {self.dit_model}...")
+            progress_fn(15, f"  blocks_to_swap={blocks_to_swap}, "
+                           f"vae_tile={vae_tile_size}, overlap={vae_tile_overlap}")
 
         torch_compile_args = None
         if self.use_torch_compile:
@@ -137,10 +168,10 @@ class SeedVR2Pipeline:
             },
             encode_tiled=True,
             encode_tile_size=(vae_tile_size, vae_tile_size),
-            encode_tile_overlap=(64, 64),
+            encode_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
             decode_tiled=True,
             decode_tile_size=(vae_tile_size, vae_tile_size),
-            decode_tile_overlap=(64, 64),
+            decode_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
             attention_mode=self.attention_mode,
             torch_compile_args_dit=torch_compile_args,
             torch_compile_args_vae=torch_compile_args,
@@ -155,8 +186,14 @@ class SeedVR2Pipeline:
             self.ctx['compute_dtype'], self.debug
         )
 
+        # Store loaded settings
+        self._loaded_blocks_to_swap = blocks_to_swap
+        self._loaded_vae_tile_size = vae_tile_size
+        self._loaded_vae_tile_overlap = vae_tile_overlap
+
         if progress_fn:
-            progress_fn(100, "Models loaded!")
+            progress_fn(100, f"Models loaded! (swap={blocks_to_swap}, "
+                            f"tile={vae_tile_size}, overlap={vae_tile_overlap})")
 
         self._loaded = True
 
@@ -173,11 +210,14 @@ class SeedVR2Pipeline:
 
     @torch.inference_mode()
     def upscale_image(self, image_np, resolution, max_resolution, seed=42,
-                      color_correction="lab", blocks_to_swap=0,
+                      color_correction="lab",
                       input_noise_scale=0.0, latent_noise_scale=0.0,
                       progress_fn=None):
         """
         Upscale a single image through the 4-phase pipeline.
+
+        blocks_to_swap and VAE tiling are configured at model load time
+        (via load_models), not per-run. Call needs_reload() to check.
 
         Args:
             image_np: Input image as numpy array (H, W, 3), uint8 or float32
@@ -185,7 +225,6 @@ class SeedVR2Pipeline:
             max_resolution: Maximum resolution (any edge)
             seed: Random seed
             color_correction: Color correction mode
-            blocks_to_swap: BlockSwap count
             progress_fn: Callback (percent, message)
 
         Returns:
@@ -318,7 +357,6 @@ def _tile_and_upscale(pipeline, image_np, preset, seed, color_correction,
         result = pipeline.upscale_image(
             tile, resolution=per_tile_resolution, max_resolution=per_tile_max,
             seed=seed, color_correction=color_correction,
-            blocks_to_swap=preset["blocks_to_swap"],
             input_noise_scale=input_noise_scale,
             latent_noise_scale=latent_noise_scale,
             progress_fn=tile_progress
@@ -385,17 +423,20 @@ class ModelLoadWorker(QThread):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, pipeline, blocks_to_swap=0, vae_tile_size=768):
+    def __init__(self, pipeline, blocks_to_swap=9, vae_tile_size=768,
+                 vae_tile_overlap=32):
         super().__init__()
         self.pipeline = pipeline
         self.blocks_to_swap = blocks_to_swap
         self.vae_tile_size = vae_tile_size
+        self.vae_tile_overlap = vae_tile_overlap
 
     def run(self):
         try:
             self.pipeline.load_models(
                 blocks_to_swap=self.blocks_to_swap,
                 vae_tile_size=self.vae_tile_size,
+                vae_tile_overlap=self.vae_tile_overlap,
                 progress_fn=lambda p, m: self.progress.emit(p, m)
             )
             self.finished.emit()
@@ -425,6 +466,9 @@ class UpscaleWorker(QThread):
             preset = RESOLUTION_PRESETS[self.preset_name]
             image = self.image_np.copy()
 
+            # Use preset latent_noise_scale (0.001 for 4K+, 0.0 for 2K-3K)
+            latent_noise = preset.get("latent_noise_scale", self.latent_noise_scale)
+
             # Apply blur if configured
             if preset["blur_radius"] > 0:
                 self.progress.emit(2, f"Applying blur (radius={preset['blur_radius']})...")
@@ -435,7 +479,7 @@ class UpscaleWorker(QThread):
                 result = _tile_and_upscale(
                     self.pipeline, image, preset,
                     self.seed, self.color_correction,
-                    self.input_noise_scale, self.latent_noise_scale,
+                    self.input_noise_scale, latent_noise,
                     lambda p, m: self.progress.emit(p, m)
                 )
             else:
@@ -445,9 +489,8 @@ class UpscaleWorker(QThread):
                     max_resolution=preset["max_resolution"],
                     seed=self.seed,
                     color_correction=self.color_correction,
-                    blocks_to_swap=preset["blocks_to_swap"],
                     input_noise_scale=self.input_noise_scale,
-                    latent_noise_scale=self.latent_noise_scale,
+                    latent_noise_scale=latent_noise,
                     progress_fn=lambda p, m: self.progress.emit(p, m)
                 )
 
@@ -542,6 +585,7 @@ class MainWindow(QMainWindow):
         self.output_image_np = None
         self.pipeline = None
         self.worker = None
+        self._pending_upscale = False
 
         # Dark theme
         self._apply_dark_theme()
@@ -644,12 +688,35 @@ class MainWindow(QMainWindow):
         self.attn_combo.addItems(["spargeattn", "sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"])
         adv_layout.addWidget(self.attn_combo)
 
-        # Blocks to swap
+        # Blocks to swap (DiT offload to CPU for VRAM saving)
         adv_layout.addWidget(QLabel("Blocks swap:"))
         self.blocks_spin = QSpinBox()
-        self.blocks_spin.setRange(0, 36)
-        self.blocks_spin.setValue(0)
+        self.blocks_spin.setRange(0, 40)
+        self.blocks_spin.setValue(9)
+        self.blocks_spin.setToolTip("DiT transformer blocks offloaded to CPU.\n"
+                                     "Higher = less VRAM but slower.\n"
+                                     "2K-4K: 9, 6K: 16, 9K-12K: 32")
         adv_layout.addWidget(self.blocks_spin)
+
+        # VAE tile size
+        adv_layout.addWidget(QLabel("VAE tile:"))
+        self.vae_tile_spin = QSpinBox()
+        self.vae_tile_spin.setRange(256, 2048)
+        self.vae_tile_spin.setSingleStep(128)
+        self.vae_tile_spin.setValue(768)
+        self.vae_tile_spin.setToolTip("VAE encode/decode tile size.\n"
+                                      "2K-3K: 1024, 4K+: 768\n"
+                                      "Smaller = less VRAM")
+        adv_layout.addWidget(self.vae_tile_spin)
+
+        # VAE tile overlap
+        adv_layout.addWidget(QLabel("Overlap:"))
+        self.vae_overlap_spin = QSpinBox()
+        self.vae_overlap_spin.setRange(8, 128)
+        self.vae_overlap_spin.setSingleStep(8)
+        self.vae_overlap_spin.setValue(32)
+        self.vae_overlap_spin.setToolTip("VAE tile overlap.\n2K-3K: 64, 4K+: 32")
+        adv_layout.addWidget(self.vae_overlap_spin)
 
         # torch.compile
         self.compile_check = QCheckBox("torch.compile")
@@ -760,9 +827,23 @@ class MainWindow(QMainWindow):
     def _on_preset_click(self, name):
         for n, btn in self.res_buttons.items():
             btn.setChecked(n == name)
-        # Update blocks_to_swap from preset
+        # Update all settings from preset
         preset = RESOLUTION_PRESETS[name]
         self.blocks_spin.setValue(preset["blocks_to_swap"])
+        self.vae_tile_spin.setValue(preset["vae_tile_size"])
+        self.vae_overlap_spin.setValue(preset["vae_tile_overlap"])
+
+        # Show reload hint if settings differ from loaded model
+        if self.pipeline and self.pipeline._loaded:
+            if self.pipeline.needs_reload(
+                preset["blocks_to_swap"], preset["vae_tile_size"],
+                preset["vae_tile_overlap"]
+            ):
+                self.statusBar().showMessage(
+                    f"{name} preset: blocks_to_swap={preset['blocks_to_swap']}, "
+                    f"vae_tile={preset['vae_tile_size']} "
+                    f"— will auto-reload models on Upscale"
+                )
 
     def _get_selected_preset(self):
         for name, btn in self.res_buttons.items():
@@ -810,6 +891,8 @@ class MainWindow(QMainWindow):
         attention = self.attn_combo.currentText()
         use_compile = self.compile_check.isChecked()
         blocks = self.blocks_spin.value()
+        vae_tile = self.vae_tile_spin.value()
+        vae_overlap = self.vae_overlap_spin.value()
 
         self.pipeline = SeedVR2Pipeline(
             dit_model=dit_model,
@@ -820,9 +903,14 @@ class MainWindow(QMainWindow):
 
         self.load_btn.setEnabled(False)
         self.upscale_btn.setEnabled(False)
-        self.statusBar().showMessage("Loading models into VRAM...")
+        self.statusBar().showMessage(
+            f"Loading models (swap={blocks}, tile={vae_tile}, overlap={vae_overlap})..."
+        )
 
-        self._load_worker = ModelLoadWorker(self.pipeline, blocks_to_swap=blocks)
+        self._load_worker = ModelLoadWorker(
+            self.pipeline, blocks_to_swap=blocks,
+            vae_tile_size=vae_tile, vae_tile_overlap=vae_overlap
+        )
         self._load_worker.progress.connect(self._on_progress)
         self._load_worker.finished.connect(self._on_models_loaded)
         self._load_worker.error.connect(self._on_error)
@@ -835,25 +923,96 @@ class MainWindow(QMainWindow):
             self.upscale_btn.setEnabled(True)
         self.progress_bar.setValue(0)
 
-        # Show VRAM usage
+        # Show VRAM usage and loaded settings
+        info_parts = []
+        if self.pipeline and self.pipeline._loaded:
+            info_parts.append(f"swap={self.pipeline._loaded_blocks_to_swap}")
+            info_parts.append(f"tile={self.pipeline._loaded_vae_tile_size}")
+            info_parts.append(f"VAE tiled=ON")
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             total = torch.cuda.get_device_properties(0).total_mem / 1024**3
-            self.statusBar().showMessage(
-                f"Models loaded — VRAM: {allocated:.1f}GB / {total:.1f}GB"
-            )
-        else:
-            self.statusBar().showMessage("Models loaded — Ready")
+            info_parts.append(f"VRAM: {allocated:.1f}GB / {total:.1f}GB")
+        self.statusBar().showMessage(f"Models loaded — {', '.join(info_parts)}")
+
+        # If upscale was pending (auto-load from Upscale button), start it
+        if hasattr(self, '_pending_upscale') and self._pending_upscale:
+            self._pending_upscale = False
+            preset_name = self._get_selected_preset()
+            self._start_upscale(preset_name)
 
     def _on_upscale(self):
-        if self.input_image_np is None or not self.pipeline or not self.pipeline._loaded:
+        if self.input_image_np is None:
+            return
+        if not self.pipeline or not self.pipeline._loaded:
+            # Auto-load models first
+            self._pending_upscale = True
+            self._on_load_models()
             return
 
         preset_name = self._get_selected_preset()
+        preset = RESOLUTION_PRESETS[preset_name]
+
+        # Auto-reload if preset requires different model settings
+        if self.pipeline.needs_reload(
+            preset["blocks_to_swap"], preset["vae_tile_size"],
+            preset["vae_tile_overlap"]
+        ):
+            self.statusBar().showMessage(
+                f"Reloading models for {preset_name} "
+                f"(swap: {self.pipeline._loaded_blocks_to_swap}→{preset['blocks_to_swap']}, "
+                f"tile: {self.pipeline._loaded_vae_tile_size}→{preset['vae_tile_size']})..."
+            )
+            # Update UI spins to match preset
+            self.blocks_spin.setValue(preset["blocks_to_swap"])
+            self.vae_tile_spin.setValue(preset["vae_tile_size"])
+            self.vae_overlap_spin.setValue(preset["vae_tile_overlap"])
+            # Reload then upscale
+            self._pending_upscale = True
+            self._do_reload_for_preset()
+            return
+
+        self._start_upscale(preset_name)
+
+    def _do_reload_for_preset(self):
+        """Reload models with current UI settings, then start upscale."""
+        blocks = self.blocks_spin.value()
+        vae_tile = self.vae_tile_spin.value()
+        vae_overlap = self.vae_overlap_spin.value()
+
         self.upscale_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.load_btn.setEnabled(False)
-        self.statusBar().showMessage(f"Upscaling to {preset_name}...")
+
+        self._load_worker = ModelLoadWorker(
+            self.pipeline, blocks_to_swap=blocks,
+            vae_tile_size=vae_tile, vae_tile_overlap=vae_overlap
+        )
+        self._load_worker.progress.connect(self._on_progress)
+        self._load_worker.finished.connect(self._on_reload_then_upscale)
+        self._load_worker.error.connect(self._on_error)
+        self._load_worker.start()
+
+    def _on_reload_then_upscale(self):
+        """Called after auto-reload, starts the upscale."""
+        self._on_models_loaded()
+        if self._pending_upscale:
+            self._pending_upscale = False
+            preset_name = self._get_selected_preset()
+            self._start_upscale(preset_name)
+
+    def _start_upscale(self, preset_name):
+        """Start the actual upscale worker."""
+        self.upscale_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.load_btn.setEnabled(False)
+
+        preset = RESOLUTION_PRESETS[preset_name]
+        self.statusBar().showMessage(
+            f"Upscaling to {preset_name} "
+            f"(swap={preset['blocks_to_swap']}, tile={preset['vae_tile_size']}, "
+            f"VAE tiled=ON)..."
+        )
 
         self.worker = UpscaleWorker(
             pipeline=self.pipeline,
@@ -862,7 +1021,7 @@ class MainWindow(QMainWindow):
             seed=self.seed_spin.value(),
             color_correction=self.color_combo.currentText(),
             input_noise_scale=0.0,
-            latent_noise_scale=0.0,
+            latent_noise_scale=preset.get("latent_noise_scale", 0.0),
         )
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_upscale_done)
