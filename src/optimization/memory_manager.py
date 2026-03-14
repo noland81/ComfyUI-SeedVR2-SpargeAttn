@@ -793,60 +793,81 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         return True
         
     else:
-        # Moving to GPU (reload)
+        # Moving to GPU (reload for inference)
         # Check if we're in bypass mode (coming from offload)
         if not getattr(model, "_blockswap_bypass_protection", False):
-            # Not in bypass mode, blocks are already configured
+            # Not in bypass mode, blocks are already configured and active
             if debug:
                 debug.log(f"{model_name} with BlockSwap active - blocks already distributed across devices, skipping movement", category="general")
             return False
-        
-        # Get actual current device for accurate logging
+
+        # Check if blocks are already in their correct BlockSwap positions
+        # (skip-offload optimization: blocks stayed in place after Phase 2)
+        blocks_already_placed = False
+        if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
+            offload_device = model._block_swap_config.get("offload_device")
+            if offload_device:
+                # Quick check: verify a GPU block is on GPU and a CPU block is on CPU
+                try:
+                    gpu_block_device = next(model.blocks[model.blocks_to_swap + 1].parameters()).device
+                    cpu_block_device = next(model.blocks[0].parameters()).device
+                    if (gpu_block_device.type == target_device.type and
+                            cpu_block_device.type == offload_device.type):
+                        blocks_already_placed = True
+                except (StopIteration, IndexError):
+                    pass
+
+        if blocks_already_placed:
+            # Blocks are in correct positions — just reactivate BlockSwap
+            if debug:
+                if hasattr(model, '_block_swap_config'):
+                    blocks_on_gpu = model._block_swap_config.get('total_blocks', 32) - model._block_swap_config.get('blocks_swapped', 16)
+                    total_blocks = model._block_swap_config.get('total_blocks', 32)
+                    debug.log(f"BlockSwap: blocks already in place ({blocks_on_gpu}/{total_blocks} on {_device_str(target_device)}), reactivating", category="success")
+            runner._blockswap_active = True
+            set_blockswap_bypass(runner=runner, bypass=False, debug=debug)
+            return False
+
+        # Blocks were fully offloaded — need to restore them
         actual_current_device = None
         for param in model.parameters():
             if param.device.type != 'meta':
                 actual_current_device = param.device
                 break
-        
+
         current_device_desc = _device_str(actual_current_device) if actual_current_device else "OFFLOAD"
-        
+
         if debug:
             debug.log(f"Moving {model_name} from {current_device_desc} to {_device_str(target_device)} ({reason or 'inference requirement'})", category="general")
-        
+
         timer_name = f"{model_name.lower()}_to_gpu"
         if debug:
             debug.start_timer(timer_name)
-        
+
         # Restore blocks to their configured devices
         if hasattr(model, "blocks") and hasattr(model, "blocks_to_swap"):
-            # Use configured offload_device from BlockSwap config
             offload_device = model._block_swap_config.get("offload_device")
             if not offload_device:
                 raise ValueError("BlockSwap config missing offload_device")
-            
+
             # Move blocks according to BlockSwap configuration
             for b, block in enumerate(model.blocks):
                 if b > model.blocks_to_swap:
-                    # This block should be on GPU
                     block.to(target_device)
                 else:
-                    # This block stays on offload device (will be swapped during forward)
                     block.to(offload_device)
-            
+
             # Handle I/O components
             if not model._block_swap_config.get("swap_io_components", False):
-                # I/O components should be on GPU if not offloaded
                 for name, module in model.named_children():
                     if name != "blocks":
                         module.to(target_device)
             else:
-                # I/O components stay on offload device
                 for name, module in model.named_children():
                     if name != "blocks":
                         module.to(offload_device)
-            
+
             if debug:
-                # Get actual configuration from runner
                 if hasattr(model, '_block_swap_config'):
                     blocks_on_gpu = model._block_swap_config.get('total_blocks', 32) - model._block_swap_config.get('blocks_swapped', 16)
                     total_blocks = model._block_swap_config.get('total_blocks', 32)
@@ -855,16 +876,14 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
                 else:
                     debug.log("BlockSwap blocks restored to configured devices", category="success")
 
-        
-        # Reactivate BlockSwap now that blocks are restored to their configured devices
+
+        # Reactivate BlockSwap
         runner._blockswap_active = True
-        
-        # Disable bypass, re-enable protection
         set_blockswap_bypass(runner=runner, bypass=False, debug=debug)
-        
+
         if debug:
             debug.end_timer(timer_name, "BlockSwap model restored")
-        
+
         return True
 
 
@@ -1045,32 +1064,51 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
                 delattr(actual_obj, attr)
     
     # 2. Handle model offloading (for caching or before deletion)
-    try:
-        param_device = next(runner.dit.parameters()).device
-        
-        # Move model off GPU if needed
-        if param_device.type not in ['meta', 'cpu']:
-            # MPS: skip CPU movement before deletion (unified memory, just causes sync)
-            if param_device.type == 'mps' and not cache_model:
-                if debug:
-                    debug.log("DiT on MPS - skipping CPU movement before deletion", category="cleanup")
-            else:
-                offload_target = getattr(runner, '_dit_offload_device', None)
-                if offload_target is None or offload_target == 'none':
-                    offload_target = torch.device('cpu')
-                reason = "model caching" if cache_model else "releasing GPU memory"
-                manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT", 
-                                   debug=debug, reason=reason, runner=runner)
-        elif param_device.type == 'meta' and debug:
-            debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
-    except StopIteration:
-        pass
-    
-    # 3. Clean BlockSwap after model movement
-    if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
-        # Import here to avoid circular dependency
+    #
+    # BlockSwap + caching optimization: keep blocks in their BlockSwap positions
+    # (swapped blocks on CPU, non-swapped on GPU) instead of offloading everything
+    # to CPU. This saves ~3s per warm run (no offload + restore round-trip).
+    # VRAM budget: ~6GB DiT (GPU blocks) + ~5GB VAE workspace = ~11GB < 24GB.
+    from .blockswap import is_blockswap_enabled
+    has_active_blockswap = (
+        hasattr(runner, "_blockswap_active") and runner._blockswap_active and
+        hasattr(runner, '_dit_block_swap_config') and
+        is_blockswap_enabled(runner._dit_block_swap_config)
+    )
+
+    if has_active_blockswap and cache_model:
+        # BlockSwap + caching: keep blocks in place, just deactivate
+        if debug:
+            debug.log("DiT BlockSwap: keeping blocks in place for warm run (skip offload)", category="cleanup")
         from .blockswap import cleanup_blockswap
-        cleanup_blockswap(runner=runner, keep_state_for_cache=cache_model)
+        cleanup_blockswap(runner=runner, keep_state_for_cache=True)
+    else:
+        # Non-BlockSwap or not caching: standard offload/delete flow
+        try:
+            param_device = next(runner.dit.parameters()).device
+
+            # Move model off GPU if needed
+            if param_device.type not in ['meta', 'cpu']:
+                # MPS: skip CPU movement before deletion (unified memory, just causes sync)
+                if param_device.type == 'mps' and not cache_model:
+                    if debug:
+                        debug.log("DiT on MPS - skipping CPU movement before deletion", category="cleanup")
+                else:
+                    offload_target = getattr(runner, '_dit_offload_device', None)
+                    if offload_target is None or offload_target == 'none':
+                        offload_target = torch.device('cpu')
+                    reason = "model caching" if cache_model else "releasing GPU memory"
+                    manage_model_device(model=runner.dit, target_device=offload_target, model_name="DiT",
+                                       debug=debug, reason=reason, runner=runner)
+            elif param_device.type == 'meta' and debug:
+                debug.log("DiT on meta device - keeping structure for cache", category="cleanup")
+        except StopIteration:
+            pass
+
+        # Clean BlockSwap after model movement (if active)
+        if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
+            from .blockswap import cleanup_blockswap
+            cleanup_blockswap(runner=runner, keep_state_for_cache=cache_model)
     
     # 4. Complete cleanup if not caching
     if not cache_model:

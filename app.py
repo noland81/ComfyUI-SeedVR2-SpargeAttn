@@ -14,7 +14,10 @@ Requirements:
 
 import sys
 import os
+import io
+import json
 import time
+import subprocess
 
 # Fix Windows console encoding (cp1252 can't handle emoji in SeedVR2 logs)
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -34,6 +37,7 @@ if script_dir not in sys.path:
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 os.environ.setdefault("LOCAL_RANK", "0")
 
+import psutil
 import torch
 import numpy as np
 from PIL import Image
@@ -42,449 +46,22 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QSpinBox, QCheckBox, QProgressBar,
-    QFileDialog, QGroupBox, QSplitter, QStatusBar, QSizePolicy, QScrollArea
+    QFileDialog, QGroupBox, QSplitter, QStatusBar, QSizePolicy, QScrollArea,
+    QPlainTextEdit
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QMimeData
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QMimeData, QTimer
 from PySide6.QtGui import QPixmap, QImage, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor
 
-# SeedVR2 imports
-from src.core.generation_utils import (
-    setup_generation_context, prepare_runner, load_text_embeddings,
-    compute_generation_info, log_generation_start
+# Pipeline module — shared between GUI app and backend
+from pipeline import (
+    RESOLUTION_PRESETS, SeedVR2Pipeline, run_upscale,
+    _resize_to_megapixels, _resize_keep_proportion,
+    _make_dimensions_even, _apply_gaussian_blur,
+    _tile_and_upscale,
 )
-from src.core.generation_phases import (
-    encode_all_batches, upscale_all_batches,
-    decode_all_batches, postprocess_all_batches
-)
-from src.utils.debug import Debug
-from src.utils.constants import get_script_directory, SEEDVR2_FOLDER_NAME, get_base_cache_dir
-from src.utils.model_registry import get_available_dit_models, DEFAULT_VAE
-from src.utils.downloads import download_weight
-from src.optimization.memory_manager import clear_memory, get_gpu_backend
 
-
-# ─── Resolution Presets ───────────────────────────────────────────────
-
-RESOLUTION_PRESETS = {
-    # Values extracted from user's actual ComfyUI workflows for RTX 4090 (24GB)
-    #
-    # 2K/3K (workflow-refix-*): No preprocessing, direct SeedVR2 upscale
-    # 4K/6K (comfyui_workflow_*): Pre-resize (keep proportion) → Blur → SeedVR2
-    # 9K (comfyui_workflow_9k): Pre-resize → Blur → Make-even → Adaptive tile → SeedVR2
-    # 12K (comfyui_workflow_12k): Pre-resize → Blur → Make-even → 2x2 tile → SeedVR2
-    #
-    # pre_resize: Resize longest edge to this value (keep proportion, lanczos) before SeedVR2
-    # tile_mode: None=direct, "adaptive"=landscape 2x1/portrait 1x2, (rows,cols)=fixed grid
-    # resolution: "auto"=min(resized_w, resized_h) or fixed int
-
-    "2K": {"pre_resize": None, "blur_radius": 0, "tile_mode": None,
-           "resolution": 2000, "max_resolution": 2000,
-           "blocks_to_swap": 9, "vae_tile_size": 1024, "vae_tile_overlap": 64,
-           "latent_noise_scale": 0.0},
-    "3K": {"pre_resize": None, "blur_radius": 0, "tile_mode": None,
-           "resolution": 3000, "max_resolution": 3000,
-           "blocks_to_swap": 9, "vae_tile_size": 1024, "vae_tile_overlap": 64,
-           "latent_noise_scale": 0.0},
-    "4K": {"pre_resize": 4096, "blur_radius": 1, "tile_mode": None,
-           "resolution": "auto", "max_resolution": 6000,
-           "blocks_to_swap": 8, "vae_tile_size": 768, "vae_tile_overlap": 32,
-           "latent_noise_scale": 0.001},
-    "6K": {"pre_resize": 6000, "blur_radius": 2, "tile_mode": None,
-           "resolution": "auto", "max_resolution": 6000,
-           "blocks_to_swap": 16, "vae_tile_size": 768, "vae_tile_overlap": 32,
-           "latent_noise_scale": 0.001},
-    "9K": {"pre_resize": 9000, "blur_radius": 2, "tile_mode": "adaptive",
-           "resolution": "auto", "max_resolution": 9000,
-           "blocks_to_swap": 32, "vae_tile_size": 768, "vae_tile_overlap": 32,
-           "latent_noise_scale": 0.001},
-    "12K": {"pre_resize": 12000, "blur_radius": 3, "tile_mode": (2, 2),
-            "resolution": "auto", "max_resolution": 12000,
-            "blocks_to_swap": 32, "vae_tile_size": 768, "vae_tile_overlap": 32,
-            "latent_noise_scale": 0.001},
-}
-
-
-# ─── Pipeline Backend ─────────────────────────────────────────────────
-
-class SeedVR2Pipeline:
-    """Direct GPU pipeline — models stay in VRAM between runs."""
-
-    def __init__(self, dit_model, device="cuda:0", attention_mode="spargeattn"):
-        self.device = device
-        self.dit_model = dit_model
-        self.vae_model = DEFAULT_VAE
-        self.attention_mode = attention_mode
-
-        self.runner = None
-        self.ctx = None
-        self.debug = Debug(enabled=True)
-        self.script_directory = get_script_directory()
-        self.model_dir = get_base_cache_dir()
-        self._loaded = False
-
-        # Track loaded settings for auto-reload detection
-        self._loaded_blocks_to_swap = None
-        self._loaded_vae_tile_size = None
-        self._loaded_vae_tile_overlap = None
-
-    def needs_reload(self, blocks_to_swap, vae_tile_size, vae_tile_overlap):
-        """Check if model needs reloading for different settings."""
-        if not self._loaded:
-            return True
-        return (self._loaded_blocks_to_swap != blocks_to_swap or
-                self._loaded_vae_tile_size != vae_tile_size or
-                self._loaded_vae_tile_overlap != vae_tile_overlap)
-
-    def load_models(self, blocks_to_swap=9, vae_tile_size=768,
-                    vae_tile_overlap=32, progress_fn=None):
-        """Load models into VRAM. Re-call with different params to reload."""
-        if progress_fn:
-            progress_fn(5, "Setting up CUDA optimizations...")
-
-        # GPU optimizations
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-
-        # Free existing models if reloading
-        if self._loaded:
-            if progress_fn:
-                progress_fn(5, "Freeing previous models...")
-            self.runner = None
-            self.ctx = None
-            clear_memory()
-
-        if progress_fn:
-            progress_fn(10, "Initializing generation context...")
-
-        self.ctx = setup_generation_context(
-            dit_device=self.device,
-            vae_device=self.device,
-            debug=self.debug
-        )
-
-        if progress_fn:
-            progress_fn(12, f"Checking/downloading models: {self.dit_model}...")
-
-        # Auto-download models if not present (matches ComfyUI node behavior)
-        if not download_weight(dit_model=self.dit_model, vae_model=self.vae_model,
-                               model_dir=self.model_dir, debug=self.debug):
-            raise RuntimeError(
-                f"Failed to download required models. "
-                f"DiT: {self.dit_model}, VAE: {self.vae_model}. "
-                f"Check internet connection and try again."
-            )
-
-        if progress_fn:
-            progress_fn(15, f"Loading DiT model: {self.dit_model}...")
-            progress_fn(15, f"  blocks_to_swap={blocks_to_swap}, "
-                           f"vae_tile={vae_tile_size}, overlap={vae_tile_overlap}")
-
-        self.runner, cache_context = prepare_runner(
-            dit_model=self.dit_model,
-            vae_model=self.vae_model,
-            model_dir=self.model_dir,
-            debug=self.debug,
-            ctx=self.ctx,
-            block_swap_config={
-                'blocks_to_swap': blocks_to_swap,
-                'swap_io_components': False,
-                'offload_device': torch.device("cpu") if blocks_to_swap > 0 else None,
-            },
-            encode_tiled=True,
-            encode_tile_size=(vae_tile_size, vae_tile_size),
-            encode_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
-            decode_tiled=True,
-            decode_tile_size=(vae_tile_size, vae_tile_size),
-            decode_tile_overlap=(vae_tile_overlap, vae_tile_overlap),
-            attention_mode=self.attention_mode,
-            torch_compile_args_dit=None,
-            torch_compile_args_vae=None,
-        )
-        self.ctx['cache_context'] = cache_context
-
-        if progress_fn:
-            progress_fn(80, "Loading text embeddings...")
-
-        self.ctx['text_embeds'] = load_text_embeddings(
-            self.script_directory, self.ctx['dit_device'],
-            self.ctx['compute_dtype'], self.debug
-        )
-
-        # Store loaded settings
-        self._loaded_blocks_to_swap = blocks_to_swap
-        self._loaded_vae_tile_size = vae_tile_size
-        self._loaded_vae_tile_overlap = vae_tile_overlap
-
-        if progress_fn:
-            progress_fn(100, f"Models loaded! (swap={blocks_to_swap}, "
-                            f"tile={vae_tile_size}, overlap={vae_tile_overlap})")
-
-        self._loaded = True
-
-    def _reset_ctx_for_run(self):
-        """Reset context state for a new run, keeping device config and models."""
-        keys_to_keep = {
-            'dit_device', 'vae_device', 'dit_offload_device',
-            'vae_offload_device', 'tensor_offload_device', 'compute_dtype',
-            'cache_context', 'text_embeds', 'interrupt_fn', 'comfyui_available',
-        }
-        for key in list(self.ctx.keys()):
-            if key not in keys_to_keep:
-                self.ctx[key] = None if key in ('video_transform', 'final_video') else []
-
-    @torch.inference_mode()
-    def upscale_image(self, image_np, resolution, max_resolution, seed=42,
-                      color_correction="lab",
-                      input_noise_scale=0.0, latent_noise_scale=0.0,
-                      progress_fn=None):
-        """
-        Upscale a single image through the 4-phase pipeline.
-
-        blocks_to_swap and VAE tiling are configured at model load time
-        (via load_models), not per-run. Call needs_reload() to check.
-
-        Args:
-            image_np: Input image as numpy array (H, W, 3), uint8 or float32
-            resolution: Target resolution (shortest edge)
-            max_resolution: Maximum resolution (any edge)
-            seed: Random seed
-            color_correction: Color correction mode
-            progress_fn: Callback (percent, message)
-
-        Returns:
-            Upscaled image as numpy array (H', W', 3), uint8
-        """
-        if not self._loaded:
-            raise RuntimeError("Models not loaded. Call load_models() first.")
-
-        self._reset_ctx_for_run()
-
-        # Convert numpy to tensor [1, H, W, 3] float32 range [0,1]
-        if image_np.dtype == np.uint8:
-            image_tensor = torch.from_numpy(image_np).float() / 255.0
-        else:
-            image_tensor = torch.from_numpy(image_np).float()
-        image_tensor = image_tensor.unsqueeze(0)  # [1, H, W, C]
-
-        if progress_fn:
-            progress_fn(5, "Preparing image...")
-
-        # Compute generation info
-        image_tensor, gen_info = compute_generation_info(
-            ctx=self.ctx, images=image_tensor,
-            resolution=resolution, max_resolution=max_resolution,
-            batch_size=1, seed=seed, debug=self.debug
-        )
-        log_generation_start(gen_info, self.debug)
-
-        # Phase 1: Encode
-        if progress_fn:
-            progress_fn(10, "Phase 1/4: VAE Encoding...")
-        self.ctx = encode_all_batches(
-            self.runner, ctx=self.ctx, images=image_tensor,
-            debug=self.debug, batch_size=1, seed=seed,
-            resolution=resolution, max_resolution=max_resolution,
-            input_noise_scale=input_noise_scale,
-            color_correction=color_correction
-        )
-
-        # Phase 2: Upscale (DiT inference — the heavy part)
-        if progress_fn:
-            progress_fn(25, "Phase 2/4: DiT Upscaling...")
-        self.ctx = upscale_all_batches(
-            self.runner, ctx=self.ctx, debug=self.debug,
-            seed=seed, latent_noise_scale=latent_noise_scale,
-            cache_model=True
-        )
-
-        # Phase 3: Decode
-        if progress_fn:
-            progress_fn(75, "Phase 3/4: VAE Decoding...")
-        self.ctx = decode_all_batches(
-            self.runner, ctx=self.ctx, debug=self.debug,
-            cache_model=True
-        )
-
-        # Phase 4: Post-process
-        if progress_fn:
-            progress_fn(90, "Phase 4/4: Color correction...")
-        self.ctx = postprocess_all_batches(
-            ctx=self.ctx, debug=self.debug,
-            color_correction=color_correction,
-            batch_size=1
-        )
-
-        # Get result
-        result = self.ctx['final_video']
-        if result.is_cuda:
-            result = result.cpu()
-        if result.dtype != torch.float32:
-            result = result.to(torch.float32)
-
-        # Convert to numpy uint8 [H, W, 3]
-        result_np = (result.squeeze(0).clamp(0, 1).numpy() * 255).astype(np.uint8)
-
-        if progress_fn:
-            progress_fn(100, "Done!")
-
-        return result_np
-
-
-def _resize_keep_proportion(image_np, target_size):
-    """
-    Resize image keeping aspect ratio, longest edge = target_size.
-    Uses Lanczos interpolation. Matches ComfyUI ImageResize+ (keep proportion).
-    """
-    img = Image.fromarray(image_np)
-    w, h = img.size
-    if w >= h:
-        new_w = target_size
-        new_h = round(h * target_size / w)
-    else:
-        new_h = target_size
-        new_w = round(w * target_size / h)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    return np.array(img)
-
-
-def _make_dimensions_even(image_np, divisor=2):
-    """
-    Stretch-resize to make dimensions divisible by divisor.
-    Matches ComfyUI workflow math: round(dim / divisor) * divisor.
-    """
-    h, w = image_np.shape[:2]
-    new_w = round(w / divisor) * divisor
-    new_h = round(h / divisor) * divisor
-    if new_w != w or new_h != h:
-        img = Image.fromarray(image_np)
-        img = img.resize((new_w, new_h), Image.LANCZOS)
-        return np.array(img)
-    return image_np
-
-
-def _apply_gaussian_blur(image_np, radius):
-    """Apply Gaussian blur to numpy image using PIL."""
-    from PIL import ImageFilter
-    img = Image.fromarray(image_np)
-    img = img.filter(ImageFilter.GaussianBlur(radius=radius))
-    return np.array(img)
-
-
-def _tile_and_upscale(pipeline, image_np, tile_mode, max_resolution,
-                      seed, color_correction, input_noise_scale,
-                      latent_noise_scale, overlap_rate, progress_fn):
-    """
-    Split pre-processed image into overlapping tiles, upscale each, reassemble.
-    Matches ComfyUI TTP_Image_Tile_Batch + TTP_Image_Assy behavior.
-
-    tile_mode: "adaptive" — landscape: 2 cols x 1 row, portrait: 1 col x 2 rows
-               (rows, cols) — fixed grid (e.g. (2,2) for 12K)
-
-    Resolution per tile = min(tile_w, tile_h) — matches ImpactMinMax(mode=false).
-    max_resolution stays at preset level (NOT divided).
-    """
-    h, w, c = image_np.shape
-
-    # Determine tile grid (matches ComfyUI ImpactCompare + CR Set Value On Boolean)
-    if tile_mode == "adaptive":
-        if w >= h:
-            cols, rows = 2, 1  # landscape: split horizontally
-        else:
-            cols, rows = 1, 2  # portrait: split vertically
-    else:
-        rows, cols = tile_mode
-
-    # Base tile sizes
-    base_tile_h = h // rows
-    base_tile_w = w // cols
-    overlap_px_h = max(int(base_tile_h * overlap_rate), 16)
-    overlap_px_w = max(int(base_tile_w * overlap_rate), 16)
-
-    # Cut tiles with overlap
-    tiles = []
-    positions = []
-    for r in range(rows):
-        for c_idx in range(cols):
-            y0 = max(0, r * base_tile_h - overlap_px_h)
-            y1 = min(h, (r + 1) * base_tile_h + overlap_px_h)
-            x0 = max(0, c_idx * base_tile_w - overlap_px_w)
-            x1 = min(w, (c_idx + 1) * base_tile_w + overlap_px_w)
-            tiles.append(image_np[y0:y1, x0:x1])
-            positions.append((r, c_idx, y0, y1, x0, x1))
-
-    total_tiles = len(tiles)
-    upscaled_tiles = []
-
-    for i, tile in enumerate(tiles):
-        tile_h_px, tile_w_px = tile.shape[:2]
-        # Resolution = min(tile_w, tile_h) — matching ImpactMinMax(mode=false)
-        tile_resolution = min(tile_w_px, tile_h_px)
-
-        def tile_progress(pct, msg, _i=i):
-            overall = int((_i / total_tiles + pct / 100 / total_tiles) * 100)
-            if progress_fn:
-                progress_fn(overall, f"Tile {_i+1}/{total_tiles}: {msg}")
-
-        result = pipeline.upscale_image(
-            tile, resolution=tile_resolution, max_resolution=max_resolution,
-            seed=seed, color_correction=color_correction,
-            input_noise_scale=input_noise_scale,
-            latent_noise_scale=latent_noise_scale,
-            progress_fn=tile_progress
-        )
-        upscaled_tiles.append(result)
-
-    # Compute scale factor from first tile
-    scale_h = upscaled_tiles[0].shape[0] / (positions[0][3] - positions[0][2])
-    scale_w = upscaled_tiles[0].shape[1] / (positions[0][5] - positions[0][4])
-
-    out_h = int(h * scale_h)
-    out_w = int(w * scale_w)
-    output = np.zeros((out_h, out_w, c), dtype=np.float32)
-    weights = np.zeros((out_h, out_w, 1), dtype=np.float32)
-
-    for idx, (r, c_idx, y0, y1, x0, x1) in enumerate(positions):
-        tile_up = upscaled_tiles[idx].astype(np.float32)
-        th, tw = tile_up.shape[:2]
-
-        out_y0 = int(y0 * scale_h)
-        out_x0 = int(x0 * scale_w)
-        out_y1 = out_y0 + th
-        out_x1 = out_x0 + tw
-
-        # Clip to output bounds
-        out_y1 = min(out_y1, out_h)
-        out_x1 = min(out_x1, out_w)
-        th = out_y1 - out_y0
-        tw = out_x1 - out_x0
-        tile_up = tile_up[:th, :tw]
-
-        # Weight mask with linear ramp at overlap edges
-        w_mask = np.ones((th, tw, 1), dtype=np.float32)
-        scaled_overlap_h = int(overlap_px_h * scale_h)
-        scaled_overlap_w = int(overlap_px_w * scale_w)
-
-        if r > 0 and scaled_overlap_h > 0:
-            ramp = np.linspace(0, 1, min(scaled_overlap_h, th)).reshape(-1, 1, 1)
-            w_mask[:min(scaled_overlap_h, th)] *= ramp
-        if r < rows - 1 and scaled_overlap_h > 0:
-            ramp = np.linspace(1, 0, min(scaled_overlap_h, th)).reshape(-1, 1, 1)
-            w_mask[-min(scaled_overlap_h, th):] *= ramp
-        if c_idx > 0 and scaled_overlap_w > 0:
-            ramp = np.linspace(0, 1, min(scaled_overlap_w, tw)).reshape(1, -1, 1)
-            w_mask[:, :min(scaled_overlap_w, tw)] *= ramp
-        if c_idx < cols - 1 and scaled_overlap_w > 0:
-            ramp = np.linspace(1, 0, min(scaled_overlap_w, tw)).reshape(1, -1, 1)
-            w_mask[:, -min(scaled_overlap_w, tw):] *= ramp
-
-        output[out_y0:out_y1, out_x0:out_x1] += tile_up * w_mask
-        weights[out_y0:out_y1, out_x0:out_x1] += w_mask
-
-    # Normalize by weights
-    weights = np.maximum(weights, 1e-6)
-    output = (output / weights).clip(0, 255).astype(np.uint8)
-    return output
+# SeedVR2 imports (still needed for model registry in GUI)
+from src.utils.model_registry import get_available_dit_models, get_available_vae_models, DEFAULT_VAE
 
 
 # ─── QThread Worker ───────────────────────────────────────────────────
@@ -535,68 +112,14 @@ class UpscaleWorker(QThread):
 
     def run(self):
         try:
-            preset = RESOLUTION_PRESETS[self.preset_name]
-            image = self.image_np.copy()
-            latent_noise = preset.get("latent_noise_scale", self.latent_noise_scale)
-
-            # ── Step 1: Pre-resize (keep proportion, lanczos) ──
-            # 4K+: resize longest edge to target before SeedVR2
-            # 2K/3K: skip (direct upscale)
-            pre_resize = preset.get("pre_resize")
-            if pre_resize:
-                h0, w0 = image.shape[:2]
-                self.progress.emit(1, f"Pre-resize to {pre_resize}px (keep proportion)...")
-                image = _resize_keep_proportion(image, pre_resize)
-                h1, w1 = image.shape[:2]
-                print(f"[PRE-RESIZE] {w0}x{h0} → {w1}x{h1}")
-
-            # ── Step 2: Compute resolution ──
-            # "auto": min(w, h) of pre-resized image (matches ImpactMinMax)
-            # Fixed int: use directly (2K/3K)
-            h, w = image.shape[:2]
-            if preset["resolution"] == "auto":
-                resolution = min(w, h)
-            else:
-                resolution = preset["resolution"]
-
-            # ── Step 3: Blur ──
-            if preset["blur_radius"] > 0:
-                self.progress.emit(2, f"Applying blur (radius={preset['blur_radius']})...")
-                image = _apply_gaussian_blur(image, preset["blur_radius"])
-
-            # ── Step 4: Process ──
-            tile_mode = preset.get("tile_mode")
-            if tile_mode is not None:
-                # Tiled processing (9K/12K)
-                # Make dimensions even (stretch resize — matches workflow math)
-                image = _make_dimensions_even(image, divisor=2)
-                h2, w2 = image.shape[:2]
-                print(f"[TILE-PREPROCESS] After make-even: {w2}x{h2}, "
-                      f"tile_mode={tile_mode}")
-
-                result = _tile_and_upscale(
-                    self.pipeline, image, tile_mode,
-                    max_resolution=preset["max_resolution"],
-                    seed=self.seed,
-                    color_correction=self.color_correction,
-                    input_noise_scale=self.input_noise_scale,
-                    latent_noise_scale=latent_noise,
-                    overlap_rate=0.05,
-                    progress_fn=lambda p, m: self.progress.emit(p, m)
-                )
-            else:
-                # Direct processing (2K/3K/4K/6K)
-                result = self.pipeline.upscale_image(
-                    image,
-                    resolution=resolution,
-                    max_resolution=preset["max_resolution"],
-                    seed=self.seed,
-                    color_correction=self.color_correction,
-                    input_noise_scale=self.input_noise_scale,
-                    latent_noise_scale=latent_noise,
-                    progress_fn=lambda p, m: self.progress.emit(p, m)
-                )
-
+            result = run_upscale(
+                self.pipeline, self.image_np, self.preset_name,
+                seed=self.seed,
+                color_correction=self.color_correction,
+                input_noise_scale=self.input_noise_scale,
+                latent_noise_scale=self.latent_noise_scale,
+                progress_fn=lambda p, m: self.progress.emit(p, m)
+            )
             self.finished.emit(result)
         except Exception as e:
             import traceback
@@ -673,6 +196,167 @@ class ImageLabel(QLabel):
                 return
 
 
+# ─── System Monitor Widget ────────────────────────────────────────────
+
+def _query_nvidia_smi():
+    """Query GPU utilization, VRAM, and temperature via nvidia-smi."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi',
+             '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu',
+             '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(',')
+            vram_used = int(parts[1].strip())
+            vram_total = int(parts[2].strip())
+            return {
+                'gpu_util': int(parts[0].strip()),
+                'vram_used_mb': vram_used,
+                'vram_total_mb': vram_total,
+                'vram_pct': int(vram_used / vram_total * 100) if vram_total > 0 else 0,
+                'temp': int(parts[3].strip()),
+            }
+    except Exception:
+        pass
+    return None
+
+
+class SystemMonitor(QWidget):
+    """Crystools-style system monitor: CPU, RAM, GPU, VRAM, Temp."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(6)
+
+        # Create monitor bars
+        self._bars = {}
+        for name, color in [("CPU", "#4caf50"), ("RAM", "#2196f3"),
+                             ("GPU", "#ff9800"), ("VRAM", "#9c27b0")]:
+            lbl = QLabel(name)
+            lbl.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: bold; "
+                              "background: transparent; padding: 0; margin: 0;")
+            lbl.setFixedWidth(32)
+
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFixedWidth(60)
+            bar.setFixedHeight(14)
+            bar.setTextVisible(True)
+            bar.setFormat("%p%")
+            bar.setStyleSheet(f"""
+                QProgressBar {{
+                    border: 1px solid #333; border-radius: 3px;
+                    background-color: #161b22; text-align: center;
+                    font-size: 10px; color: #ccc;
+                }}
+                QProgressBar::chunk {{
+                    background-color: {color}; border-radius: 2px;
+                }}
+            """)
+
+            layout.addWidget(lbl)
+            layout.addWidget(bar)
+            self._bars[name] = bar
+
+        # Temperature label
+        self._temp_label = QLabel("--°C")
+        self._temp_label.setStyleSheet(
+            "color: #ef5350; font-size: 11px; font-weight: bold; "
+            "background: transparent; padding: 0 4px; margin: 0;")
+        layout.addWidget(self._temp_label)
+
+        # Timer — update every 2 seconds
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._update)
+        self._timer.start(2000)
+        self._update()
+
+    def _update(self):
+        # CPU & RAM (psutil)
+        try:
+            self._bars["CPU"].setValue(int(psutil.cpu_percent(interval=0)))
+            mem = psutil.virtual_memory()
+            self._bars["RAM"].setValue(int(mem.percent))
+        except Exception:
+            pass
+
+        # GPU, VRAM, Temp (nvidia-smi)
+        stats = _query_nvidia_smi()
+        if stats:
+            self._bars["GPU"].setValue(stats['gpu_util'])
+            self._bars["VRAM"].setValue(stats['vram_pct'])
+            temp = stats['temp']
+            self._temp_label.setText(f"{temp}°C")
+            # Color temperature: green < 60, yellow 60-80, red > 80
+            if temp < 60:
+                tcolor = "#4caf50"
+            elif temp < 80:
+                tcolor = "#ff9800"
+            else:
+                tcolor = "#ef5350"
+            self._temp_label.setStyleSheet(
+                f"color: {tcolor}; font-size: 11px; font-weight: bold; "
+                "background: transparent; padding: 0 4px; margin: 0;")
+
+
+# ─── Log Stream Redirector ────────────────────────────────────────────
+
+class LogStream(io.TextIOBase):
+    """Redirect stdout/stderr to a Qt signal while keeping original stream."""
+
+    def __init__(self, original_stream, signal_fn):
+        super().__init__()
+        self._original = original_stream
+        self._signal_fn = signal_fn
+
+    def write(self, text):
+        if text:
+            # Write to original stream (terminal)
+            if self._original:
+                try:
+                    self._original.write(text)
+                    self._original.flush()
+                except Exception:
+                    pass
+            # Emit to GUI (strip trailing newline for cleaner display)
+            self._signal_fn(text)
+        return len(text) if text else 0
+
+    def flush(self):
+        if self._original:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+
+    def fileno(self):
+        if self._original:
+            return self._original.fileno()
+        raise io.UnsupportedOperation("fileno")
+
+    @property
+    def encoding(self):
+        return getattr(self._original, 'encoding', 'utf-8')
+
+    def isatty(self):
+        return False
+
+
+class LogBridge(QWidget):
+    """Bridge to emit log text as Qt signal (thread-safe for cross-thread writes)."""
+    log_signal = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setVisible(False)
+
+
 # ─── Main Window ──────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -689,6 +373,8 @@ class MainWindow(QMainWindow):
         self.pipeline = None
         self.worker = None
         self._pending_upscale = False
+        self._last_open_dir = ""   # remembered between sessions via config.json
+        self._last_save_dir = ""
 
         # Dark theme
         self._apply_dark_theme()
@@ -696,9 +382,15 @@ class MainWindow(QMainWindow):
         # Build UI
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
+
+        # Left panel — main content (images, controls, progress, buttons)
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
 
         # ── Image panels ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -728,7 +420,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(output_group)
 
         splitter.setSizes([500, 500])
-        main_layout.addWidget(splitter, stretch=1)
+        left_layout.addWidget(splitter, stretch=1)
 
         # ── Controls ──
         controls_layout = QVBoxLayout()
@@ -753,7 +445,33 @@ class MainWindow(QMainWindow):
         res_row.addStretch()
         controls_layout.addLayout(res_row)
 
-        # Row 2: Basic params
+        # Row 2: Model selection (always visible)
+        model_row = QHBoxLayout()
+
+        model_row.addWidget(QLabel("DiT Model:"))
+        self.model_combo = QComboBox()
+        self._populate_models()
+        self.model_combo.setMinimumWidth(320)
+        self.model_combo.setToolTip("DiT model for upscaling.\n"
+                                     "Q8_0 = best quality GGUF (8.8 GB)\n"
+                                     "Q6_K = good balance (6.9 GB)\n"
+                                     "Q5_K_M / Q4_K_M = smaller, faster\n"
+                                     "fp16 = full precision (16.5 GB)\n"
+                                     "sharp = enhanced detail variant")
+        model_row.addWidget(self.model_combo)
+
+        model_row.addSpacing(16)
+
+        model_row.addWidget(QLabel("VAE:"))
+        self.vae_combo = QComboBox()
+        self._populate_vae_models()
+        self.vae_combo.setMinimumWidth(200)
+        model_row.addWidget(self.vae_combo)
+
+        model_row.addStretch()
+        controls_layout.addLayout(model_row)
+
+        # Row 3: Basic params
         params_row = QHBoxLayout()
 
         params_row.addWidget(QLabel("Seed:"))
@@ -772,18 +490,11 @@ class MainWindow(QMainWindow):
         params_row.addStretch()
         controls_layout.addLayout(params_row)
 
-        # Row 3: Advanced settings (collapsible)
+        # Row 4: Advanced settings (collapsible)
         self.advanced_group = QGroupBox("Advanced Settings")
         self.advanced_group.setCheckable(True)
         self.advanced_group.setChecked(False)
         adv_layout = QHBoxLayout(self.advanced_group)
-
-        # Model selection
-        adv_layout.addWidget(QLabel("Model:"))
-        self.model_combo = QComboBox()
-        self._populate_models()
-        self.model_combo.setMinimumWidth(200)
-        adv_layout.addWidget(self.model_combo)
 
         # Attention mode
         adv_layout.addWidget(QLabel("Attention:"))
@@ -798,7 +509,7 @@ class MainWindow(QMainWindow):
         self.blocks_spin.setValue(9)
         self.blocks_spin.setToolTip("DiT transformer blocks offloaded to CPU.\n"
                                      "Higher = less VRAM but slower.\n"
-                                     "2K-3K: 9, 4K: 8, 6K: 16, 9K-12K: 32")
+                                     "2K-4K: 9, 6K: 16, 9K-12K: 32")
         adv_layout.addWidget(self.blocks_spin)
 
         # VAE tile size
@@ -808,7 +519,7 @@ class MainWindow(QMainWindow):
         self.vae_tile_spin.setSingleStep(128)
         self.vae_tile_spin.setValue(768)
         self.vae_tile_spin.setToolTip("VAE encode/decode tile size.\n"
-                                      "2K-3K: 1024, 4K+: 768\n"
+                                      "2K-4K: 1024, 6K+: 768\n"
                                       "Smaller = less VRAM")
         adv_layout.addWidget(self.vae_tile_spin)
 
@@ -818,13 +529,13 @@ class MainWindow(QMainWindow):
         self.vae_overlap_spin.setRange(8, 128)
         self.vae_overlap_spin.setSingleStep(8)
         self.vae_overlap_spin.setValue(32)
-        self.vae_overlap_spin.setToolTip("VAE tile overlap.\n2K-3K: 64, 4K+: 32")
+        self.vae_overlap_spin.setToolTip("VAE tile overlap.\n2K-4K: 64, 6K+: 32")
         adv_layout.addWidget(self.vae_overlap_spin)
 
         adv_layout.addStretch()
         controls_layout.addWidget(self.advanced_group)
 
-        main_layout.addLayout(controls_layout)
+        left_layout.addLayout(controls_layout)
 
         # ── Progress bar ──
         self.progress_bar = QProgressBar()
@@ -845,7 +556,7 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             }
         """)
-        main_layout.addWidget(self.progress_bar)
+        left_layout.addWidget(self.progress_bar)
 
         # ── Action buttons ──
         btn_row = QHBoxLayout()
@@ -885,13 +596,113 @@ class MainWindow(QMainWindow):
         self.save_btn.clicked.connect(self._on_save)
         btn_row.addWidget(self.save_btn)
 
-        main_layout.addLayout(btn_row)
+        left_layout.addLayout(btn_row)
 
-        # ── Status bar ──
+        # Add left panel to main layout
+        main_layout.addWidget(left_widget, stretch=1)
+
+        # ── Terminal log panel (right side, toggleable) ──
+        self._log_visible = True
+        self.terminal_widget = QWidget()
+        terminal_layout = QVBoxLayout(self.terminal_widget)
+        terminal_layout.setContentsMargins(0, 0, 0, 0)
+        terminal_layout.setSpacing(4)
+
+        terminal_header = QHBoxLayout()
+        self.terminal_toggle_btn = QPushButton("Hide \u25b6")
+        self.terminal_toggle_btn.setFixedHeight(24)
+        self.terminal_toggle_btn.setStyleSheet("""
+            QPushButton { padding: 2px 12px; background-color: #21262d; border: 1px solid #333;
+                          border-radius: 4px; font-size: 11px; color: #8b949e; }
+            QPushButton:hover { background-color: #30363d; border-color: #555; color: #c9d1d9; }
+        """)
+        self.terminal_toggle_btn.clicked.connect(self._toggle_terminal)
+        terminal_header.addStretch()
+        terminal_header.addWidget(self.terminal_toggle_btn)
+        terminal_layout.addLayout(terminal_header)
+
+        self.log_console = QPlainTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumBlockCount(5000)  # limit buffer
+        self.log_console.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+                font-size: 11px;
+                padding: 4px;
+                selection-background-color: #264f78;
+            }
+        """)
+        terminal_layout.addWidget(self.log_console)
+
+        self.terminal_widget.setFixedWidth(340)
+        main_layout.addWidget(self.terminal_widget)
+
+        # Setup log redirection (stdout + stderr → log_console)
+        self._log_bridge = LogBridge(self)
+        self._log_bridge.log_signal.connect(self._append_log)
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        sys.stdout = LogStream(self._original_stdout, self._log_bridge.log_signal.emit)
+        sys.stderr = LogStream(self._original_stderr, self._log_bridge.log_signal.emit)
+
+        # ── Elapsed timer (for upscale time tracking) ──
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
+        self._elapsed_msg = ""  # last progress message
+
+        # ── Status bar with system monitor ──
+        self.sys_monitor = SystemMonitor()
+        self.statusBar().addPermanentWidget(self.sys_monitor)
         self.statusBar().showMessage("Ready — Load models to begin")
 
-        # Default preset
-        self._on_preset_click("4K")
+        # ── Restore saved config or use defaults ──
+        config = self._load_config()
+        if config:
+            # Restore combo boxes (only if value exists in dropdown)
+            idx = self.model_combo.findText(config.get("dit_model", ""))
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            idx = self.vae_combo.findText(config.get("vae_model", ""))
+            if idx >= 0:
+                self.vae_combo.setCurrentIndex(idx)
+            idx = self.attn_combo.findText(config.get("attention_mode", ""))
+            if idx >= 0:
+                self.attn_combo.setCurrentIndex(idx)
+            idx = self.color_combo.findText(config.get("color_correction", ""))
+            if idx >= 0:
+                self.color_combo.setCurrentIndex(idx)
+
+            # Restore preset (also sets blocks/vae_tile/overlap)
+            saved_preset = config.get("preset", "4K")
+            if saved_preset in RESOLUTION_PRESETS:
+                self._on_preset_click(saved_preset)
+            else:
+                self._on_preset_click("4K")
+
+            # Restore seed
+            self.seed_spin.setValue(config.get("seed", 42))
+
+            # Restore UI state
+            if not config.get("terminal_visible", True):
+                self._toggle_terminal()
+            self.advanced_group.setChecked(config.get("advanced_expanded", False))
+
+            # Restore last directories
+            self._last_open_dir = config.get("last_open_dir", "")
+            self._last_save_dir = config.get("last_save_dir", "")
+
+            print(f"[CONFIG] Restored settings from config.json "
+                  f"(preset={saved_preset}, model={config.get('dit_model', '?')})")
+        else:
+            # First run — use defaults
+            self._on_preset_click("4K")
+
+        # Auto-load models on startup (uses whatever model is currently selected)
+        QTimer.singleShot(500, self._on_load_models)
 
     def _apply_dark_theme(self):
         self.setStyleSheet("""
@@ -911,16 +722,46 @@ class MainWindow(QMainWindow):
         """)
 
     def _populate_models(self):
+        """Populate DiT model dropdown — 7B only, no Q3 (user preference)."""
         try:
-            models = get_available_dit_models()
+            all_models = get_available_dit_models()
+            # Filter: 7B only, exclude Q3 variants
+            models = [m for m in all_models
+                      if "3b" not in m.lower() and "q3" not in m.lower()]
+            # Ensure Q8_0 is always in list (used in all workflows)
+            q8_name = "seedvr2_ema_7b-Q8_0.gguf"
+            if q8_name not in models:
+                models.insert(0, q8_name)
+            # Sort: GGUF quants by size (Q8>Q6>Q5>Q4), then safetensors
+            def sort_key(name):
+                n = name.lower()
+                if "sharp" in n:
+                    group = 1  # sharp after standard
+                else:
+                    group = 0
+                # Priority within group: Q8_0, Q6_K, Q5_K_M, Q4_K_M, fp8, fp16
+                for rank, pat in enumerate(["q8_0", "q6_k", "q5_k_m", "q4_k_m",
+                                            "fp8_e4m3fn_mixed", "fp8_e4m3fn", "fp16"]):
+                    if pat in n:
+                        return (group, rank)
+                return (group, 99)
+            models.sort(key=sort_key)
             self.model_combo.addItems(models)
-            # Select 7B GGUF if available
+            # Default: Q8_0
             for i, m in enumerate(models):
-                if "7b" in m.lower() and "q8" in m.lower():
+                if "7b-q8_0" in m.lower() and "sharp" not in m.lower():
                     self.model_combo.setCurrentIndex(i)
                     break
         except Exception:
             self.model_combo.addItem("seedvr2_ema_7b-Q8_0.gguf")
+
+    def _populate_vae_models(self):
+        """Populate VAE model dropdown."""
+        try:
+            models = get_available_vae_models()
+            self.vae_combo.addItems(models)
+        except Exception:
+            self.vae_combo.addItem(DEFAULT_VAE)
 
     def _on_preset_click(self, name):
         for n, btn in self.res_buttons.items():
@@ -958,10 +799,11 @@ class MainWindow(QMainWindow):
             return
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Image", "",
+            self, "Select Image", self._last_open_dir,
             "Images (*.png *.jpg *.jpeg *.bmp *.tiff *.webp);;All Files (*)"
         )
         if path:
+            self._last_open_dir = os.path.dirname(path)
             self._load_image(path)
 
     def _load_image(self, path):
@@ -986,6 +828,7 @@ class MainWindow(QMainWindow):
 
     def _on_load_models(self):
         dit_model = self.model_combo.currentText()
+        vae_model = self.vae_combo.currentText()
         attention = self.attn_combo.currentText()
         blocks = self.blocks_spin.value()
         vae_tile = self.vae_tile_spin.value()
@@ -993,6 +836,7 @@ class MainWindow(QMainWindow):
 
         self.pipeline = SeedVR2Pipeline(
             dit_model=dit_model,
+            vae_model=vae_model,
             device="cuda:0",
             attention_mode=attention,
         )
@@ -1027,7 +871,7 @@ class MainWindow(QMainWindow):
             info_parts.append(f"VAE tiled=ON")
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
             info_parts.append(f"VRAM: {allocated:.1f}GB / {total:.1f}GB")
         self.statusBar().showMessage(f"Models loaded — {', '.join(info_parts)}")
 
@@ -1124,9 +968,12 @@ class MainWindow(QMainWindow):
         self.worker.finished.connect(self._on_upscale_done)
         self.worker.error.connect(self._on_error)
         self._start_time = time.time()
+        self._elapsed_msg = ""
+        self._elapsed_timer.start(1000)  # update every 1 second
         self.worker.start()
 
     def _on_upscale_done(self, result_np):
+        self._elapsed_timer.stop()
         self.output_image_np = result_np
         elapsed = time.time() - self._start_time
 
@@ -1140,33 +987,121 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.progress_bar.setValue(100)
-        self.statusBar().showMessage(f"Done! {w}x{h} in {elapsed:.1f}s")
+        mins, secs = divmod(int(elapsed), 60)
+        time_str = f"{mins}m {secs}s" if mins > 0 else f"{elapsed:.1f}s"
+        self.progress_bar.setFormat(f"100% — Done! {w}x{h} in {time_str}")
+        self.statusBar().showMessage(f"Done! {w}x{h} in {time_str}")
 
     def _on_save(self):
         if self.output_image_np is None:
             return
 
         # Default filename based on input
-        default_name = "upscaled.png"
+        default_name = "upscaled.jpg"
         if self.input_image_path:
             stem = Path(self.input_image_path).stem
             preset = self._get_selected_preset()
-            default_name = f"{stem}_{preset}.png"
+            default_name = f"{stem}_{preset}.jpg"
+
+        save_dir = self._last_save_dir or self._last_open_dir or ""
+        default_path = os.path.join(save_dir, default_name) if save_dir else default_name
 
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Upscaled Image", default_name,
-            "PNG (*.png);;JPEG (*.jpg);;All Files (*)"
+            self, "Save Upscaled Image", default_path,
+            "JPEG sRGB (*.jpg);;PNG (*.png);;All Files (*)"
         )
         if path:
+            self._last_save_dir = os.path.dirname(path)
             img = Image.fromarray(self.output_image_np)
-            img.save(path)
+            ext = os.path.splitext(path)[1].lower()
+            if ext in ('.jpg', '.jpeg'):
+                # sRGB JPEG 95% quality
+                from PIL import ImageCms
+                srgb_profile = ImageCms.createProfile("sRGB")
+                icc_bytes = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+                img.save(path, "JPEG", quality=95, icc_profile=icc_bytes)
+            else:
+                img.save(path)
             self.statusBar().showMessage(f"Saved: {path}")
 
     def _on_progress(self, percent, message):
+        self._elapsed_msg = message
+        elapsed = int(time.time() - self._start_time) if hasattr(self, '_start_time') else 0
         self.progress_bar.setValue(percent)
-        self.progress_bar.setFormat(f"%p% — {message}")
+        self.progress_bar.setFormat(f"%p% — {message}  [{elapsed}s]")
+
+    def _update_elapsed(self):
+        """Update elapsed time display every second during upscale."""
+        if hasattr(self, '_start_time'):
+            elapsed = int(time.time() - self._start_time)
+            pct = self.progress_bar.value()
+            self.progress_bar.setFormat(f"{pct}% — {self._elapsed_msg}  [{elapsed}s]")
+
+    def _save_config(self):
+        """Save current settings to config.json on app close."""
+        config = {
+            "dit_model": self.model_combo.currentText(),
+            "vae_model": self.vae_combo.currentText(),
+            "preset": self._get_selected_preset(),
+            "attention_mode": self.attn_combo.currentText(),
+            "seed": self.seed_spin.value(),
+            "color_correction": self.color_combo.currentText(),
+            "terminal_visible": self._log_visible,
+            "advanced_expanded": self.advanced_group.isChecked(),
+            "last_open_dir": self._last_open_dir,
+            "last_save_dir": self._last_save_dir,
+        }
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"[WARNING] Failed to save config: {e}")
+
+    def _load_config(self):
+        """Load saved settings from config.json. Returns dict or None."""
+        config_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"[WARNING] Failed to load config: {e}")
+        return None
+
+    def closeEvent(self, event):
+        """Save config and restore stdout/stderr on close."""
+        self._save_config()
+        sys.stdout = self._original_stdout
+        sys.stderr = self._original_stderr
+        super().closeEvent(event)
+
+    def _toggle_terminal(self):
+        """Toggle terminal log panel visibility (right-side panel)."""
+        self._log_visible = not self._log_visible
+        self.log_console.setVisible(self._log_visible)
+        if self._log_visible:
+            self.terminal_widget.setFixedWidth(340)
+            self.terminal_toggle_btn.setText("Hide \u25b6")
+        else:
+            self.terminal_widget.setFixedWidth(40)
+            self.terminal_toggle_btn.setText("\u25c0")
+
+    def _append_log(self, text):
+        """Append text to terminal log panel (thread-safe via signal)."""
+        # Strip trailing newline for cleaner display
+        if text.endswith('\n'):
+            text = text[:-1]
+        if text:
+            self.log_console.appendPlainText(text)
+            # Auto-scroll to bottom
+            scrollbar = self.log_console.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _on_error(self, error_msg):
+        self._elapsed_timer.stop()
         self.upscale_btn.setEnabled(True)
         self.load_btn.setEnabled(True)
         self.progress_bar.setValue(0)
@@ -1182,9 +1117,21 @@ def main():
     app.setStyle("Fusion")
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 
+def _hide_console_window():
+    """Hide the console window on Windows. All output goes to the in-app terminal."""
+    try:
+        import ctypes
+        ctypes.windll.user32.ShowWindow(
+            ctypes.windll.kernel32.GetConsoleWindow(), 0  # SW_HIDE
+        )
+    except Exception:
+        pass  # Non-Windows or no console — ignore
+
+
 if __name__ == "__main__":
+    _hide_console_window()
     main()

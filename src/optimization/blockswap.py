@@ -139,6 +139,44 @@ def _log_swap_timing(debug, t_start: Optional[float], component_id, component_ty
         )
 
 
+def _pin_module_memory(module: torch.nn.Module) -> None:
+    """
+    Pin CPU module's parameter/buffer memory for faster async GPU transfers.
+
+    Pinned (page-locked) memory enables truly async CPU→GPU DMA transfers
+    with non_blocking=True. Without pinning, non_blocking has no effect
+    for CPU→GPU copies (PyTorch falls back to synchronous cudaMemcpy).
+
+    Should be called ONCE during BlockSwap setup, after blocks are placed on CPU.
+    """
+    for param in module.parameters():
+        if param.data.device.type == 'cpu' and not param.data.is_pinned():
+            param.data = param.data.pin_memory()
+    for name, buf in module.named_buffers():
+        if buf.data.device.type == 'cpu' and not buf.data.is_pinned():
+            buf.data = buf.data.pin_memory()
+
+
+def _ensure_pinned(module: torch.nn.Module) -> bool:
+    """
+    Lazy pin: ensure a CPU module has pinned memory before async prefetch.
+
+    Quick-checks first parameter — if already pinned, returns immediately (no-op).
+    On cold start: blocks pinned by _configure_blocks → always no-op.
+    On warm run: blocks may be unpinned from non_blocking GPU→CPU offload → pins them.
+
+    Returns True if pinning was performed, False if already pinned or not on CPU.
+    """
+    try:
+        first_param = next(module.parameters())
+    except StopIteration:
+        return False
+    if first_param.data.device.type == 'cpu' and not first_param.data.is_pinned():
+        _pin_module_memory(module)
+        return True
+    return False
+
+
 def get_module_memory_mb(module: torch.nn.Module) -> float:
     """
     Calculate memory usage of a module in MB.
@@ -251,6 +289,33 @@ def apply_block_swap_to_dit(
     _log_memory_summary(memory_stats, offload_device, device, swap_io_components, 
                        debug)
     
+    # Create CUDA prefetch stream for async block loading
+    # When processing block N, block N+1 is loaded asynchronously on this stream
+    # This overlaps CPU→GPU DMA with GPU computation → ~2s savings for 9 blocks
+    if blocks_to_swap > 0 and device.type == 'cuda':
+        model._prefetch_stream = torch.cuda.Stream()
+        model._prefetched_idx = -1
+        debug.log("Prefetch stream created for async block loading", category="blockswap")
+
+    # Adaptive offload strategy based on block count:
+    #
+    # "async" (≤12 blocks, e.g. 4K): non_blocking on default stream.
+    #   VRAM has enough headroom for deferred release. Saves ~150ms/block.
+    #
+    # "sync" (>12 blocks, e.g. 6K+): blocking offload on default stream.
+    #   With many blocks, non_blocking defers VRAM release → accumulation
+    #   causes CUDA allocator stalls (17-36s/block on 6K with 16 blocks).
+    #   Sync offload costs ~16ms/block but frees VRAM immediately.
+    #
+    # Note: "streamed" strategy (dedicated offload stream + periodic sync)
+    # was attempted but caused OOM — pending offloads between sync points
+    # kept ~4 blocks of VRAM occupied, pushing total over 24GB on 6K.
+    _ASYNC_OFFLOAD_THRESHOLD = 12
+    model._offload_strategy = "async" if blocks_to_swap <= _ASYNC_OFFLOAD_THRESHOLD else "sync"
+    debug.log(f"Offload strategy: {model._offload_strategy} "
+              f"(blocks_to_swap={blocks_to_swap}, threshold={_ASYNC_OFFLOAD_THRESHOLD})",
+              category="blockswap")
+
     # Wrap block forward methods for dynamic swapping (only if blocks_to_swap > 0)
     if blocks_to_swap > 0:
         for b, block in enumerate(model.blocks):
@@ -320,6 +385,8 @@ def _configure_io_components(
             
             if swap_io_components:
                 module.to(offload_device)
+                if offload_device.type == 'cpu':
+                    _pin_module_memory(module)
                 _wrap_io_forward(module, name, model, debug)
                 io_components_offloaded.append(name)
                 io_memory_mb += module_memory
@@ -374,7 +441,10 @@ def _configure_blocks(
             block.to(device)
             total_main_memory += block_memory
         else:
-            block.to(offload_device, non_blocking=False)
+            block.to(offload_device)
+            # Pin CPU memory for faster async CPU→GPU transfers (prefetching)
+            if offload_device.type == 'cpu':
+                _pin_module_memory(block)
             total_offload_memory += block_memory
 
     # Ensure all buffers match their containing module's device
@@ -382,7 +452,7 @@ def _configure_blocks(
         target_device = device if b > model.blocks_to_swap else offload_device
         for name, buffer in block.named_buffers():
             if buffer.device != torch.device(target_device):
-                buffer.data = buffer.data.to(target_device, non_blocking=False)
+                buffer.data = buffer.data.to(target_device)
 
     return {
         "offload_memory": total_offload_memory,
@@ -488,7 +558,7 @@ def _wrap_block_forward(
         # Retrieve weak references
         model = model_ref()
         debug = debug_ref()
-        
+
         if not model:
             # Model has been garbage collected, fall back to original
             return original_forward(*args, **kwargs)
@@ -498,24 +568,86 @@ def _wrap_block_forward(
             # Use dynamo-disabled helper to get start time (avoids compilation warnings)
             t_start = _get_swap_start_time(debug, debug.enabled if debug else False)
 
-            # Only move to GPU if necessary
-            current_device = next(self.parameters()).device
             target_device = torch.device(model.main_device)
-            
+            prefetch_stream = getattr(model, '_prefetch_stream', None)
+
+            # --- STEP 1: Ensure this block is on GPU ---
+            t1 = time.perf_counter()
+            current_device = next(self.parameters()).device
             if current_device != target_device:
-                self.to(model.main_device, non_blocking=False)
+                if (prefetch_stream is not None and
+                        getattr(model, '_prefetched_idx', -1) == self._block_idx):
+                    # Block was prefetched on async stream — just wait for DMA to finish
+                    torch.cuda.current_stream().wait_stream(prefetch_stream)
+                    model._prefetched_idx = -1
+                else:
+                    # Not prefetched (block 0 or fallback) — lazy pin + sync load
+                    # Lazy pin: on warm run, blocks may be unpinned from previous
+                    # non_blocking offload. Pinning before sync load enables faster
+                    # DMA through page-locked memory path.
+                    _ensure_pinned(self)
+                    self.to(target_device)
+            t2 = time.perf_counter()
 
-            # Execute forward pass with OOM protection
+            # --- STEP 2: Prefetch NEXT swapped block asynchronously ---
+            # Lazy pin + prefetch on separate CUDA stream while this block
+            # computes on default stream. Overlaps CPU→GPU DMA with compute.
+            next_idx = self._block_idx + 1
+            if (prefetch_stream is not None and
+                    next_idx <= model.blocks_to_swap and
+                    next_idx < len(model.blocks)):
+                next_block = model.blocks[next_idx]
+                if next(next_block.parameters()).device != target_device:
+                    # Lazy pin: ensure pinned memory for true async DMA.
+                    # Cold start: already pinned by _configure_blocks (no-op).
+                    # Warm run: may be unpinned from non_blocking offload.
+                    _ensure_pinned(next_block)
+                    with torch.cuda.stream(prefetch_stream):
+                        next_block.to(target_device, non_blocking=True)
+                    model._prefetched_idx = next_idx
+            t3 = time.perf_counter()
+
+            # --- STEP 3: Compute on default stream ---
             output = original_forward(*args, **kwargs)
+            t4 = time.perf_counter()
 
-            # Move back to offload device
-            self.to(model.offload_device, non_blocking=False)
-            
+            # --- STEP 4: Offload to CPU ---
+            # Adaptive strategy set during configure_block_swap:
+            # - "async" (≤12 blocks, 4K): non_blocking, deferred VRAM release.
+            #   VRAM headroom is sufficient for deferred release.
+            # - "sync" (>12 blocks, 6K+): blocking, immediate VRAM release.
+            #   Prevents VRAM accumulation that causes OOM/stalls.
+            offload_strategy = getattr(model, '_offload_strategy', 'sync')
+            if offload_strategy == "async":
+                self.to(model.offload_device, non_blocking=True)
+            else:
+                self.to(model.offload_device)
+            t5 = time.perf_counter()
+
+            # Detailed timing for first 3 blocks or slow blocks → write to diag log file
+            total_ms = (t5 - t1) * 1000
+            if total_ms > 2000 or self._block_idx < 3:
+                alloc_gb = torch.cuda.memory_allocated() / (1024**3)
+                reserved_gb = torch.cuda.memory_reserved() / (1024**3)
+                _msg = (f"Block {self._block_idx}: "
+                        f"load={((t2-t1)*1000):.0f}ms "
+                        f"prefetch={((t3-t2)*1000):.0f}ms "
+                        f"compute={((t4-t3)*1000):.0f}ms "
+                        f"offload={((t5-t4)*1000):.0f}ms "
+                        f"total={total_ms:.0f}ms "
+                        f"VRAM={alloc_gb:.2f}GB/{reserved_gb:.2f}GB")
+                try:
+                    from diag_logger import diag
+                    diag("BLOCK", _msg)
+                except Exception:
+                    print(f"[DIAG-BLOCK] {_msg}")
+
             # Use dynamo-disabled helper to log timing (avoids compilation warnings)
             _log_swap_timing(debug, t_start, self._block_idx, "block")
 
-            # Only clear cache under memory pressure
-            clear_memory(debug=debug, deep=False, force=False, timer_name="wrap_block_forward")
+            # Skip per-block clear_memory — between-phase empty_cache() is sufficient.
+            # Per-block clear adds ~5ms overhead × 9 blocks × 36 layers = significant,
+            # and rarely triggers anyway (force=False means only under memory pressure).
         else:
             output = original_forward(*args, **kwargs)
 
@@ -568,33 +700,35 @@ def _wrap_io_forward(
         # Retrieve weak references
         model = model_ref()
         debug = debug_ref()
-        
+
         if not model:
             # Model has been garbage collected, fall back to original
             return self._original_forward(*args, **kwargs)
 
         # Use dynamo-disabled helper to get start time (avoids compilation warnings)
         t_start = _get_swap_start_time(debug, debug.enabled if debug else False)
-        
+
         # Check current device to avoid unnecessary moves
         current_device = next(self.parameters()).device
         target_device = torch.device(model.main_device)
-        
-        # Move to GPU for computation if needed
+
+        # Move to GPU for computation if needed (lazy pin for faster DMA)
         if current_device != target_device:
-            self.to(model.main_device, non_blocking=False)
+            _ensure_pinned(self)
+            self.to(model.main_device)
 
         # Execute forward pass
         output = self._original_forward(*args, **kwargs)
 
-        # Move back to offload device
-        self.to(model.offload_device, non_blocking=False)
-        
+        # Offload: adaptive strategy (matches block forward wrapper)
+        offload_strategy = getattr(model, '_offload_strategy', 'sync')
+        if offload_strategy == "async":
+            self.to(model.offload_device, non_blocking=True)
+        else:
+            self.to(model.offload_device)
+
         # Use dynamo-disabled helper to log timing (avoids compilation warnings)
         _log_swap_timing(debug, t_start, self._module_name, "I/O")
-
-        # Only clear cache under memory pressure
-        clear_memory(debug=debug, deep=False, force=False, timer_name="wrap_block_forward")
 
         return output
     
@@ -854,6 +988,16 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
             if not getattr(model, "_blockswap_bypass_protection", False):
                 set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
             runner._blockswap_active = False
+
+        # CRITICAL: Sync prefetch stream + reset prefetched index.
+        # Without this, pending async DMA operations from the current job
+        # linger on the prefetch stream → next job's block swaps wait on
+        # stale operations → 11-13s/block instead of ~250ms.
+        if hasattr(model, '_prefetch_stream') and model._prefetch_stream is not None:
+            model._prefetch_stream.synchronize()
+        if hasattr(model, '_prefetched_idx'):
+            model._prefetched_idx = -1
+
         debug.log("BlockSwap deactivated for caching (configuration preserved)", category="success")
         return
 
@@ -922,8 +1066,9 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
         debug.log("Restored original .to() method", category="success")
 
     # 5. Clean up BlockSwap-specific attributes
-    for attr in ['_blockswap_runner_ref', 'blocks_to_swap', 'main_device', 
-                 'offload_device']:
+    for attr in ['_blockswap_runner_ref', 'blocks_to_swap', 'main_device',
+                 'offload_device', '_prefetch_stream', '_prefetched_idx',
+                 '_offload_strategy']:
         if hasattr(model, attr):
             delattr(model, attr)
 

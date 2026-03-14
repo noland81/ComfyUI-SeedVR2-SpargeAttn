@@ -131,40 +131,64 @@ def validate_file(filepath: str, expected_hash: Optional[str] = None, cache_dir:
     return True
 
 
-def download_with_resume(url: str, filepath: str, debug=None) -> bool:
-    """Download with resume support and progress bar"""
+def download_with_resume(url: str, filepath: str, debug=None, progress_fn=None) -> bool:
+    """Download with resume support, progress bar, and optional GUI callback.
+
+    Args:
+        progress_fn: Optional callback(percent, message) for GUI progress updates.
+    """
     temp_file = f"{filepath}.download"
     existing_size = os.path.getsize(temp_file) if os.path.exists(temp_file) else 0
-    
+
     headers = {'Range': f'bytes={existing_size}-'} if existing_size > 0 else {}
-    
+
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as response:
             content_length = int(response.headers.get('Content-Length', 0))
             total_size = existing_size + content_length
-            
-            pbar = tqdm(total=total_size, initial=existing_size, unit='B', 
-                       unit_scale=True, unit_divisor=1024, 
-                       desc=os.path.basename(filepath))
-            
+            filename = os.path.basename(filepath)
+
+            pbar = tqdm(total=total_size, initial=existing_size, unit='B',
+                       unit_scale=True, unit_divisor=1024,
+                       desc=filename)
+
+            downloaded = existing_size
+            last_report_time = 0
             with open(temp_file, 'ab' if existing_size else 'wb') as f:
                 while chunk := response.read(DOWNLOAD_CHUNK_SIZE):
                     f.write(chunk)
+                    downloaded += len(chunk)
                     pbar.update(len(chunk))
+
+                    # Report progress to GUI callback (throttle to ~2x/sec)
+                    if progress_fn and total_size > 0:
+                        now = time.time()
+                        if now - last_report_time >= 0.5:
+                            last_report_time = now
+                            pct = int(downloaded / total_size * 100)
+                            size_gb = total_size / (1024**3)
+                            done_gb = downloaded / (1024**3)
+                            progress_fn(pct,
+                                f"Downloading {filename}: "
+                                f"{done_gb:.2f} / {size_gb:.2f} GB ({pct}%)")
             pbar.close()
-        
+
         os.replace(temp_file, filepath)
         return True
-        
+
     except Exception as e:
         if debug:
             debug.log(f"Download error: {e}", level="ERROR", category="download", force=True)
         return False
 
 
-def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = None, debug=None) -> bool:
-    """Download SeedVR2 DiT and VAE models with integrity checking"""
+def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = None, debug=None, progress_fn=None) -> bool:
+    """Download SeedVR2 DiT and VAE models with integrity checking.
+
+    Args:
+        progress_fn: Optional callback(percent, message) for GUI progress updates.
+    """
     cache_dir = model_dir or get_base_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     
@@ -255,7 +279,7 @@ def download_weight(dit_model: str, vae_model: str, model_dir: Optional[str] = N
                     debug.log(f"Retry {attempt}/{DOWNLOAD_MAX_RETRIES}", 
                              category="download", force=True)
             
-            if download_with_resume(url, filepath, debug):
+            if download_with_resume(url, filepath, debug, progress_fn=progress_fn):
                 # Validate downloaded file
                 if validate_file(filepath, expected_hash):
                     if debug:

@@ -49,7 +49,9 @@ def get_base_cache_dir() -> str:
         cache_dir = os.path.join(folder_paths.models_dir, SEEDVR2_FOLDER_NAME)
         folder_paths.add_model_folder_path(SEEDVR2_MODEL_TYPE, cache_dir)
     except:
-        cache_dir = f"./models/{SEEDVR2_FOLDER_NAME}"
+        # Without ComfyUI: use absolute path relative to project root
+        # (not CWD, which may be backend/ or any other directory)
+        cache_dir = os.path.join(get_script_directory(), "models", SEEDVR2_FOLDER_NAME)
     
     return cache_dir
 
