@@ -1,5 +1,22 @@
 # Changelog
 
+## v2.4.2 (2026-03-14) — Deblur logging + optimize blur analysis
+
+### Cai tien
+- **Detailed logging cho toan bo deblur pipeline** — Log tu API endpoint, blur analysis, den tung pass SeedVR2 voi timing chi tiet
+  - API endpoints: log request received, file info, analyze duration, errors
+  - `_process_deblur_job`: log input size, blur score, branch decision, tung pass start/done voi duration
+  - `blur_score.py`: log tung phase probe voi score + timing, GPU model move
+  - Final summary: score, effective resolution, passes, total duration
+- **Toi uu blur analysis: binary search** — Phase 1 chuyen tu linear scan (18 probes) sang binary search (~6 probes), giam thoi gian phan tich ~3-4x cho anh lon
+- **Early exit trong Phase 1** — Ngung scan khi da tim duoc threshold, khong can scan toan bo range
+- **Retry logic cho analyze** — Frontend tu dong retry 2 lan khi analyze that bai (fix "Failed to fetch" do timeout)
+
+### Files thay doi
+- `backend/app.py` — Detailed logging cho deblur API endpoints + `_process_deblur_job` pipeline
+- `backend/blur_score.py` — Binary search Phase 1 + timing logs cho moi probe + GPU move logs
+- `frontend/deblur.js` — Retry logic cho analyzeItem (max 2 retries)
+
 ## v2.4.1 (2026-03-14) — Fix deblur bugs: pre-resize overwrite, sync filter, polling timeout
 
 ### Bug fixes
